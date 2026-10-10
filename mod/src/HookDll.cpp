@@ -3652,7 +3652,7 @@ HRESULT STDMETHODCALLTYPE HookAudioClientInitialize(
                 c.wfx.Format.nAvgBytesPerSec = c.wfx.Format.nSamplesPerSec * c.wfx.Format.nBlockAlign;
                 c.wfx.Format.cbSize = 22;
                 c.wfx.Samples.wValidBitsPerSample = 32;
-                c.dwChannelMask = (pFormat->nChannels == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : 0;
+                c.wfx.dwChannelMask = (pFormat->nChannels == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : 0;
                 c.wfx.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
                 c.validBits = 32;
                 c.isFloat = false;
