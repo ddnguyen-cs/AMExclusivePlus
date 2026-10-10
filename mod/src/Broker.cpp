@@ -772,7 +772,7 @@ void HandleMessage(const Message& incoming, HANDLE source) {
         }
         if (incoming.type == MessageType::SetEnabled) {
             WritePrivateProfileStringW(L"mod", L"mode",
-                g_status.enabledIntent ? L"exclusive" : L"probe", BrokerIniPath().c_str());
+                g_status.enabledIntent ? L"exclusive" : L"shared", BrokerIniPath().c_str());
             (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, BrokerIniPath().c_str());
         }
         g_status.senderPid = GetCurrentProcessId();
@@ -869,7 +869,7 @@ int wmain() {
         return 0;
     }
     wchar_t savedMode[32]{};
-    GetPrivateProfileStringW(L"mod", L"mode", L"probe", savedMode,
+    GetPrivateProfileStringW(L"mod", L"mode", L"shared", savedMode,
         static_cast<DWORD>(std::size(savedMode)), BrokerIniPath().c_str());
     g_status.enabledIntent = _wcsicmp(savedMode, L"exclusive") == 0 ? 1 : 0;
     g_status.hardwareBufferMs = ReadHardwareBufferMs();

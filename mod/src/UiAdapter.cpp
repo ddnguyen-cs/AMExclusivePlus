@@ -48,7 +48,15 @@ using WindowObserverRef = winrt::weak_ref<Xaml::Window>;
 
 HMODULE g_module{};
 std::filesystem::path g_logPath;
+std::filesystem::path g_iniPath;
 std::mutex g_logMutex;
+
+void EnsureIniPath() {
+    if (!g_iniPath.empty()) return;
+    wchar_t modulePath[MAX_PATH]{};
+    GetModuleFileNameW(g_module, modulePath, static_cast<DWORD>(std::size(modulePath)));
+    g_iniPath = std::filesystem::path(modulePath).parent_path() / L"am-exclusive.ini";
+}
 std::mutex g_pipeMutex;
 std::mutex g_pipeWriteMutex;
 std::mutex g_statusMutex;
@@ -246,15 +254,25 @@ Message StatusSnapshot() {
 }
 
 bool SendEnabled(bool enabled) {
-    if (!g_connected.load()) return false;
-    g_pendingEnabled.store(enabled ? 1 : 0);
+    EnsureIniPath();
+    WritePrivateProfileStringW(L"mod", L"mode", enabled ? L"exclusive" : L"shared", g_iniPath.c_str());
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_iniPath.c_str());
+    {
+        std::lock_guard lock(g_statusMutex);
+        g_status.enabledIntent = enabled ? 1 : 0;
+        g_status.state = enabled ? RuntimeState::WaitingForStream : RuntimeState::Off;
+    }
+    if (g_connected.load()) {
+        g_pendingEnabled.store(enabled ? 1 : 0);
+    }
     return true;
 }
 
 bool SendHardwareBuffer(std::uint32_t milliseconds) {
-    // Keep the requested value across a transient Broker disconnect. The pipe
-    // thread sends it immediately when connected and retains it until the
-    // Broker echoes the value after verifying the INI write.
+    EnsureIniPath();
+    const auto value = std::to_wstring(static_cast<std::uint64_t>(milliseconds) * 10000u);
+    WritePrivateProfileStringW(L"mod", L"period_100ns", value.c_str(), g_iniPath.c_str());
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_iniPath.c_str());
     g_requestedHardwareBufferMs.store(static_cast<int>(milliseconds));
     g_pendingHardwareBufferMs.store(static_cast<int>(milliseconds));
     g_hardwareBufferAckDeadlineTick.store(0);
@@ -266,6 +284,10 @@ bool SendHardwareBuffer(std::uint32_t milliseconds) {
 }
 
 bool SendOutputDevice(const std::wstring& endpointId, const std::wstring& endpointName) {
+    EnsureIniPath();
+    WritePrivateProfileStringW(L"mod", L"device_id", endpointId.c_str(), g_iniPath.c_str());
+    WritePrivateProfileStringW(L"mod", L"device_name", endpointName.c_str(), g_iniPath.c_str());
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_iniPath.c_str());
     {
         std::lock_guard lock(g_pendingDeviceMutex);
         g_pendingOutputDevice = std::make_pair(endpointId, endpointName);
@@ -1940,7 +1962,8 @@ DWORD WINAPI BootstrapThread(void*) {
     const auto dir = std::filesystem::path(modulePath).parent_path();
     g_logPath = dir / L"am-exclusive-ui.log";
 
-    const auto iniPath = dir / L"am-exclusive.ini";
+    g_iniPath = dir / L"am-exclusive.ini";
+    const auto iniPath = g_iniPath;
     wchar_t savedMode[32]{};
     GetPrivateProfileStringW(L"mod", L"mode", L"shared", savedMode,
         static_cast<DWORD>(std::size(savedMode)), iniPath.c_str());
@@ -1974,6 +1997,17 @@ DWORD WINAPI BootstrapThread(void*) {
         L" bufferMs=" + std::to_wstring(bufferMs) +
         L" deviceId=" + std::wstring(savedDevId) +
         L" deviceName=" + std::wstring(savedDevName));
+
+    const auto brokerExe = dir / L"am-exclusive-broker.exe";
+    if (std::filesystem::exists(brokerExe)) {
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(brokerExe.c_str(), nullptr, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            if (pi.hProcess) CloseHandle(pi.hProcess);
+            if (pi.hThread) CloseHandle(pi.hThread);
+        }
+    }
+
     if (HANDLE pipeThread = CreateThread(nullptr, 0, PipeThread, nullptr, 0, nullptr)) CloseHandle(pipeThread);
 
     g_windowLifecycleHook = SetWinEventHook(

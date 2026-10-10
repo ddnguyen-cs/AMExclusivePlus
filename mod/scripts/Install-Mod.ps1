@@ -127,7 +127,7 @@ foreach ($existingIni in @(
 )) {
     if (-not (Test-Path -LiteralPath $existingIni -PathType Leaf)) { continue }
     foreach ($line in [IO.File]::ReadAllLines($existingIni)) {
-        if ($line -match '^\s*mode\s*=\s*(probe|exclusive)\s*$') {
+        if ($line -match '^\s*mode\s*=\s*(probe|exclusive|shared)\s*$') {
             $preservedMode = $Matches[1].ToLowerInvariant()
         }
         if ($line -match '^\s*period_100ns\s*=\s*(\d+)\s*$') {
@@ -158,7 +158,7 @@ $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
 & icacls.exe $install /inheritance:r /grant:r `
     "*$($userSid.Value):(OI)(CI)(F)" `
     '*S-1-5-18:(OI)(CI)(F)' `
-    '*S-1-15-2-1:(OI)(CI)(RX)' | Out-Null
+    '*S-1-15-2-1:(OI)(CI)(M)' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Failed to secure install directory: icacls exit $LASTEXITCODE" }
 Write-ProgressMilestone 40 'secure_install'
 

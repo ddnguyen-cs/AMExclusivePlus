@@ -3243,11 +3243,134 @@ HRESULT V2ResumeNativeGraphAfterFailedHandoff(void*, void* unit) noexcept {
     return result;
 }
 
-ammod::audio_v2::NativeAudioCallbacks V2NativeCallbacks() noexcept {
-    return {&g_audioCoreRuntime, &V2OnNativeInitialize, &V2OnNativeStart,
-            &V2BeforeNativeStop, &V2OnNativeStop, &V2OnNativeReset, &V2ShouldSuppress,
-            &V2OnNativeGetBuffer, &V2OnNativeReleaseBuffer, &V2OnNativeMethod,
-            &V2OnNativeService, &V2NativePumpPeriodMs};
+std::wstring ReadConfiguredDeviceId() {
+    wchar_t id[ammod::ipc::kEndpointIdChars]{};
+    GetPrivateProfileStringW(L"mod", L"device_id", L"", id, static_cast<DWORD>(std::size(id)), g_iniPath.c_str());
+    return id;
+}
+
+std::wstring ReadConfiguredDeviceName() {
+    wchar_t name[ammod::ipc::kEndpointNameChars]{};
+    GetPrivateProfileStringW(L"mod", L"device_name", L"", name, static_cast<DWORD>(std::size(name)), g_iniPath.c_str());
+    return name;
+}
+
+std::wstring ReadConfiguredMode() {
+    wchar_t mode[32]{};
+    GetPrivateProfileStringW(L"mod", L"mode", L"shared", mode, static_cast<DWORD>(std::size(mode)), g_iniPath.c_str());
+    return mode;
+}
+
+std::uint64_t ReadConfiguredPeriod100ns() {
+    wchar_t val[32]{};
+    GetPrivateProfileStringW(L"mod", L"period_100ns", L"200000", val, static_cast<DWORD>(std::size(val)), g_iniPath.c_str());
+    wchar_t* end{};
+    auto period = wcstoull(val, &end, 10);
+    return (period >= 10000 && period <= 1000000) ? period : 200000;
+}
+
+using AudioClientInitializeFn = HRESULT(STDMETHODCALLTYPE*)(
+    IAudioClient* self,
+    AUDCLNT_SHAREMODE shareMode,
+    DWORD streamFlags,
+    REFERENCE_TIME hnsBufferDuration,
+    REFERENCE_TIME hnsPeriodicity,
+    const WAVEFORMATEX* pFormat,
+    LPCGUID AudioSessionGuid);
+
+AudioClientInitializeFn g_originalAudioClientInitialize = nullptr;
+
+HRESULT STDMETHODCALLTYPE HookAudioClientInitialize(
+    IAudioClient* self,
+    AUDCLNT_SHAREMODE shareMode,
+    DWORD streamFlags,
+    REFERENCE_TIME hnsBufferDuration,
+    REFERENCE_TIME hnsPeriodicity,
+    const WAVEFORMATEX* pFormat,
+    LPCGUID AudioSessionGuid) {
+    try {
+        if (!g_originalAudioClientInitialize) return E_UNEXPECTED;
+
+        std::wstring formatStr;
+        DWORD sampleRate = 0;
+        WORD bits = 0;
+        WORD channels = 0;
+        if (pFormat) {
+            sampleRate = pFormat->nSamplesPerSec;
+            bits = pFormat->wBitsPerSample;
+            channels = pFormat->nChannels;
+            if (pFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE && pFormat->cbSize >= 22) {
+                auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(pFormat);
+                if (ext->Samples.wValidBitsPerSample > 0) {
+                    bits = ext->Samples.wValidBitsPerSample;
+                }
+            }
+            std::wostringstream ss;
+            ss << bits << L"-bit / " << std::fixed << std::setprecision(1)
+               << (sampleRate / 1000.0) << L" kHz (" << channels << L" ch)";
+            formatStr = ss.str();
+            Log(L"IAudioClient::Initialize requested format: " + formatStr +
+                L" callerShareMode=" + std::to_wstring(shareMode));
+        }
+
+        std::wstring mode = ReadConfiguredMode();
+        bool wantExclusive = (_wcsicmp(mode.c_str(), L"exclusive") == 0) || g_ipcEnabled.load(std::memory_order_acquire);
+        uint64_t period100ns = ReadConfiguredPeriod100ns();
+        std::wstring targetId = ReadConfiguredDeviceId();
+        std::wstring targetName = ReadConfiguredDeviceName();
+
+        if (wantExclusive && pFormat) {
+            Log(L"Attempting WASAPI Exclusive Mode initialization...");
+            HRESULT hrFormat = self->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, pFormat, nullptr);
+            if (SUCCEEDED(hrFormat)) {
+                REFERENCE_TIME requestedPeriod = period100ns ? static_cast<REFERENCE_TIME>(period100ns) : 200000;
+                REFERENCE_TIME devDefaultPeriod = 0, devMinPeriod = 0;
+                if (SUCCEEDED(self->GetDevicePeriod(&devDefaultPeriod, &devMinPeriod)) && devMinPeriod > 0) {
+                    if (requestedPeriod < devMinPeriod) requestedPeriod = devMinPeriod;
+                }
+
+                DWORD exclFlags = streamFlags;
+                REFERENCE_TIME bufferDuration = requestedPeriod;
+                REFERENCE_TIME periodicity = (exclFlags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) ? requestedPeriod : 0;
+
+                HRESULT hrExcl = g_originalAudioClientInitialize(
+                    self, AUDCLNT_SHAREMODE_EXCLUSIVE, exclFlags,
+                    bufferDuration, periodicity, pFormat, AudioSessionGuid);
+
+                if (SUCCEEDED(hrExcl)) {
+                    std::wstring displayFormat = formatStr + L" (Exclusive Bit-Perfect)";
+                    Log(L"WASAPI Exclusive Mode SUCCEEDED: " + displayFormat);
+                    SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
+                                   ammod::ipc::RuntimeState::Active,
+                                   true, targetId, targetName, displayFormat, S_OK);
+                    return S_OK;
+                } else {
+                    Log(L"WASAPI Exclusive Mode failed (hr=" + HResultText(hrExcl) + L"), falling back gracefully to Shared Mode");
+                }
+            } else {
+                Log(L"Format not supported in exclusive mode (hr=" + HResultText(hrFormat) + L"), falling back gracefully to Shared Mode");
+            }
+        }
+
+        HRESULT hrShared = g_originalAudioClientInitialize(
+            self, AUDCLNT_SHAREMODE_SHARED, streamFlags,
+            hnsBufferDuration, hnsPeriodicity, pFormat, AudioSessionGuid);
+
+        std::wstring displayFormat = formatStr + (wantExclusive ? L" (Shared Fallback)" : L" (Shared)");
+        Log(L"WASAPI Shared Mode initialized: result=" + HResultText(hrShared) + L" format=" + displayFormat);
+        SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
+                       SUCCEEDED(hrShared) ? ammod::ipc::RuntimeState::Active : ammod::ipc::RuntimeState::Off,
+                       wantExclusive, targetId, targetName, displayFormat, hrShared);
+        return hrShared;
+    } catch (...) {
+        Log(L"Exception in HookAudioClientInitialize, falling back safely");
+        if (g_originalAudioClientInitialize) {
+            return g_originalAudioClientInitialize(
+                self, AUDCLNT_SHAREMODE_SHARED, streamFlags,
+                hnsBufferDuration, hnsPeriodicity, pFormat, AudioSessionGuid);
+        }
+        return E_FAIL;
+    }
 }
 
 void HookV2Device(IMMDevice* device);
@@ -3256,31 +3379,16 @@ HRESULT STDMETHODCALLTYPE HookV2DeviceActivate(IMMDevice* self, REFIID iid, DWOR
                                                PROPVARIANT* params, void** object) {
     const auto result = g_v2OriginalDeviceActivate
         ? g_v2OriginalDeviceActivate(self, iid, context, params, object) : E_UNEXPECTED;
-    if (FAILED(result) || !object || !*object || ammod::audio_v2::NativeProxyBypassed() ||
-        !g_audioCoreRuntime.UiEnabled() ||
-        (iid != __uuidof(IAudioClient) && iid != __uuidof(IAudioClient2) &&
-         iid != __uuidof(IAudioClient3))) {
-        return result;
-    }
+    if (FAILED(result) || !object || !*object) return result;
 
-    auto* returned = reinterpret_cast<IUnknown*>(*object);
-    IAudioClient* client{};
-    const auto query = returned->QueryInterface(
-        __uuidof(IAudioClient), reinterpret_cast<void**>(&client));
-    if (FAILED(query) || !client) return result;
-    auto* proxy = new (std::nothrow) ammod::audio_v2::NativeAudioClientProxy(
-        client, V2NativeCallbacks(), DeviceId(self));
-    if (!proxy) {
-        client->Release();
-        return result;
+    if (iid == __uuidof(IAudioClient) || iid == __uuidof(IAudioClient2) || iid == __uuidof(IAudioClient3)) {
+        auto** table = Vtable(reinterpret_cast<IUnknown*>(*object));
+        if (table && table[3]) {
+            HookAddress(table[3], reinterpret_cast<void*>(&HookAudioClientInitialize),
+                        g_originalAudioClientInitialize, L"IAudioClient::Initialize");
+        }
     }
-    void* replacement{};
-    const auto wrapped = proxy->QueryInterface(iid, &replacement);
-    proxy->Release();
-    if (FAILED(wrapped) || !replacement) return result;
-    returned->Release();
-    *object = replacement;
-    return S_OK;
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE HookV2CollectionItem(IMMDeviceCollection* self, UINT index,
@@ -3306,9 +3414,28 @@ HRESULT STDMETHODCALLTYPE HookV2EnumAudioEndpoints(IMMDeviceEnumerator* self, ED
 
 HRESULT STDMETHODCALLTYPE HookV2GetDefaultEndpoint(IMMDeviceEnumerator* self, EDataFlow flow,
                                                     ERole role, IMMDevice** device) {
+    if (!device) return E_POINTER;
+    *device = nullptr;
+
+    if (flow == eRender || flow == eAll) {
+        std::wstring targetId = ReadConfiguredDeviceId();
+        if (!targetId.empty()) {
+            HRESULT hrDevice = self->GetDevice(targetId.c_str(), device);
+            if (SUCCEEDED(hrDevice) && *device) {
+                Log(L"Redirected default audio endpoint to configured DAC: " + targetId);
+                HookV2Device(*device);
+                return S_OK;
+            } else {
+                Log(L"Configured DAC not found or failed to activate (" + targetId + L"), falling back to default endpoint");
+            }
+        }
+    }
+
     const auto result = g_v2OriginalGetDefaultEndpoint
         ? g_v2OriginalGetDefaultEndpoint(self, flow, role, device) : E_UNEXPECTED;
-    if (SUCCEEDED(result) && device && *device) HookV2Device(*device);
+    if (SUCCEEDED(result) && *device) {
+        HookV2Device(*device);
+    }
     return result;
 }
 
@@ -3349,70 +3476,18 @@ HRESULT WINAPI HookV2CoCreateInstance(REFCLSID clsid, LPUNKNOWN outer, DWORD con
 
 bool InstallAudioCoreV2Hooks() {
     if (g_audioCoreV2HooksInstalled.load(std::memory_order_acquire)) return true;
-    HMODULE toolbox = GetModuleHandleW(L"CoreAudioToolbox.dll");
-    if (!toolbox) return false;
-    auto installToolbox = [toolbox](const char* name, void* detour, auto& original,
-                                    const wchar_t* label) {
-        auto* target = GetProcAddress(toolbox, name);
-        return target && HookAddress(reinterpret_cast<void*>(target), detour, original, label);
-    };
-    const bool converterNew = installToolbox(
-        "AudioConverterNew", reinterpret_cast<void*>(&HookV2AudioConverterNew),
-        g_v2OriginalAudioConverterNew, L"AudioConverterNew [v2]");
-    const bool converterSpecific = installToolbox(
-        "AudioConverterNewSpecific", reinterpret_cast<void*>(&HookV2AudioConverterNewSpecific),
-        g_v2OriginalAudioConverterNewSpecific, L"AudioConverterNewSpecific [v2]");
-    const bool converterProperty = installToolbox(
-        "AudioConverterSetProperty", reinterpret_cast<void*>(&HookV2AudioConverterSetProperty),
-        g_v2OriginalAudioConverterSetProperty, L"AudioConverterSetProperty [v2]");
-    const bool converterGetProperty = installToolbox(
-        "AudioConverterGetProperty", reinterpret_cast<void*>(&HookV2AudioConverterGetProperty),
-        g_v2OriginalAudioConverterGetProperty, L"AudioConverterGetProperty [v2]");
-    const bool converterFill = installToolbox(
-        "AudioConverterFillComplexBuffer", reinterpret_cast<void*>(&HookV2AudioConverterFillComplexBuffer),
-        g_v2OriginalAudioConverterFillComplexBuffer, L"AudioConverterFillComplexBuffer [v2]");
-    const bool converterReset = installToolbox(
-        "AudioConverterReset", reinterpret_cast<void*>(&HookV2AudioConverterReset),
-        g_v2OriginalAudioConverterReset, L"AudioConverterReset [v2]");
-    const bool converterDispose = installToolbox(
-        "AudioConverterDispose", reinterpret_cast<void*>(&HookV2AudioConverterDispose),
-        g_v2OriginalAudioConverterDispose, L"AudioConverterDispose [v2]");
-
-    const bool unitSetProperty = installToolbox(
-        "AudioUnitSetProperty", reinterpret_cast<void*>(&HookV2AudioUnitSetProperty),
-        g_v2OriginalAudioUnitSetProperty, L"AudioUnitSetProperty [v2 graph identity]");
-    const bool unitRender = installToolbox(
-        "AudioUnitRender", reinterpret_cast<void*>(&HookV2AudioUnitRender),
-        g_v2OriginalAudioUnitRender, L"AudioUnitRender [v2 observer]");
-    const bool unitStart = installToolbox(
-        "AudioOutputUnitStart", reinterpret_cast<void*>(&HookV2AudioOutputUnitStart),
-        g_v2OriginalAudioOutputUnitStart, L"AudioOutputUnitStart [v2]");
-    const bool unitStop = installToolbox(
-        "AudioOutputUnitStop", reinterpret_cast<void*>(&HookV2AudioOutputUnitStop),
-        g_v2OriginalAudioOutputUnitStop, L"AudioOutputUnitStop [v2]");
-    const bool unitInitialize = installToolbox(
-        "AudioUnitInitialize", reinterpret_cast<void*>(&HookV2AudioUnitInitialize),
-        g_v2OriginalAudioUnitInitialize, L"AudioUnitInitialize [v2]");
-    const bool unitUninitialize = installToolbox(
-        "AudioUnitUninitialize", reinterpret_cast<void*>(&HookV2AudioUnitUninitialize),
-        g_v2OriginalAudioUnitUninitialize, L"AudioUnitUninitialize [v2]");
-
     auto* ole32 = GetModuleHandleW(L"ole32.dll");
     void* coCreateTarget = ole32
         ? reinterpret_cast<void*>(GetProcAddress(ole32, "CoCreateInstance")) : nullptr;
     const bool coCreate = coCreateTarget && HookAddress(
         coCreateTarget,
         reinterpret_cast<void*>(&HookV2CoCreateInstance), g_v2OriginalCoCreateInstance,
-        L"CoCreateInstance [v2 audio-client gate]");
-    const bool ready = converterNew && converterSpecific && converterProperty &&
-                       converterGetProperty && converterFill &&
-                       converterReset && converterDispose && unitSetProperty && unitRender && unitStart &&
-                       unitStop && unitInitialize && unitUninitialize && coCreate;
-    if (ready) {
+        L"CoCreateInstance [audio-client gate]");
+    if (coCreate) {
         g_audioCoreV2HooksInstalled.store(true, std::memory_order_release);
-        Log(L"audio core v2 production hooks ready: native P0 callback handoff + Mod-owned Fill + native render gate");
+        Log(L"WASAPI Audio Client hooks ready");
     }
-    return ready;
+    return coCreate;
 }
 
 DWORD WINAPI AudioCoreV2HookLoop(void*) {
@@ -3565,30 +3640,7 @@ DWORD WINAPI InitializeHooks(void*) {
     g_nativeTraceEnabled.store(ReadBool(L"native_trace", false), std::memory_order_release);
     ammod::quality::SetEnabled(false);
     g_audioCoreGate.SetUiEnabled(false);
-    // Current production keeps Apple's acquisition scheduler alive on the
-    // software render pump while ACv2 owns only the P0 mirror and physical
-    // exclusive endpoint. The runtime must therefore preserve native/graph
-    // started bookkeeping across the endpoint handoff.
-    const ammod::audio_v2::AudioCoreRuntimeCallbacks runtimeCallbacks{
-        &g_audioCoreRuntime, &AudioCoreRuntimeEventCallback, &V2OnSinkLifecycle,
-        &V2PrepareNativeHandoff, &V2FinalizeNativeHandoff,
-        &V2ResumeNativeAfterFailedHandoff, &V2PrepareNativeGraphHandoff,
-        &V2ResumeNativeGraphAfterFailedHandoff, kNativeAcquisitionPassthrough,
-        g_nativeTraceEnabled.load(std::memory_order_acquire)};
-    if (!g_audioCoreRuntime.Start(runtimeCallbacks)) {
-        Log(L"audio core v2 runtime worker failed to start; core remains fail-closed");
-    }
-    if (!kNativeAcquisitionPassthrough) {
-        if (!g_nativeP0Puller.Start()) {
-            Log(L"audio core v2 Mod-owned P0 pull worker failed to start; native line remains fail-closed");
-        }
-    } else {
-        Log(L"audio core v2 Mod-owned P0 pull worker intentionally disabled; native acquisition passthrough enabled");
-    }
-    g_audioCoreRuntime.SetUiEnabled(false);
-    Log(L"hook DLL loaded; audio core v2 runtime staged with native acquisition passthrough A/B; quality lock installs independently of UI intent");
-    Log(L"native acquisition trace=" +
-        std::wstring(g_nativeTraceEnabled.load(std::memory_order_acquire) ? L"enabled" : L"disabled"));
+    Log(L"hook DLL loaded; clean direct WASAPI redirection architecture active; quality lock installs independently of UI intent");
     if (MH_Initialize() != MH_OK) {
         Log(L"MH_Initialize failed");
         return 1;
