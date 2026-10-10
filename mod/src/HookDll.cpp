@@ -13,6 +13,7 @@
 #include "BoundedLog.h"
 #include "IpcProtocol.h"
 #include "IpcTransport.h"
+#include "AudioDeviceUtils.h"
 #include "AudioFormatPolicy.h"
 #include "ApplePrivateOffsets.h"
 #include "LosslessQualityLock.h"
@@ -1706,8 +1707,10 @@ void CopyText(wchar_t (&destination)[N], std::wstring_view source) {
 }
 
 void SendAgentEvent(ammod::ipc::MessageType type, ammod::ipc::RuntimeState state,
-                    bool enabled, const std::wstring& endpoint = {},
-                    const WAVEFORMATEX* format = nullptr, HRESULT hr = S_OK,
+                    bool enabled, const std::wstring& endpoint,
+                    const std::wstring& endpointName,
+                    const std::wstring& formatText,
+                    HRESULT hr = S_OK,
                     ammod::ipc::ErrorCategory category = ammod::ipc::ErrorCategory::None,
                     const std::wstring& detail = {}) {
     using namespace ammod::ipc;
@@ -1719,10 +1722,19 @@ void SendAgentEvent(ammod::ipc::MessageType type, ammod::ipc::RuntimeState state
     message.hresult = hr;
     message.error = category;
     CopyText(message.endpointId, endpoint);
-    CopyText(message.format, FormatText(format));
+    CopyText(message.endpointName, endpointName);
+    CopyText(message.format, formatText);
     CopyText(message.detail, detail);
     std::lock_guard lock(g_outboundMutex);
     g_outbound.push_back(message);
+}
+
+void SendAgentEvent(ammod::ipc::MessageType type, ammod::ipc::RuntimeState state,
+                    bool enabled, const std::wstring& endpoint = {},
+                    const WAVEFORMATEX* format = nullptr, HRESULT hr = S_OK,
+                    ammod::ipc::ErrorCategory category = ammod::ipc::ErrorCategory::None,
+                    const std::wstring& detail = {}) {
+    SendAgentEvent(type, state, enabled, endpoint, {}, FormatText(format), hr, category, detail);
 }
 
 bool ExclusiveRequested() {
@@ -1754,8 +1766,14 @@ void AudioCoreRuntimeEventCallback(void* context,
             pendingLocal && runtime->BoundConverter() == pendingLocal) {
             (void)PromoteV2LocalQueue(pendingLocal);
         }
+        const auto boundEndpointId = runtime->CurrentEndpointId();
+        auto boundEndpointName = runtime->CurrentEndpointName();
+        if (boundEndpointName.empty() && !boundEndpointId.empty()) {
+            boundEndpointName = ammod::audio::GetDeviceNameFromId(boundEndpointId);
+        }
         SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
-                       ammod::ipc::RuntimeState::Probing, true);
+                       ammod::ipc::RuntimeState::Probing, true,
+                       boundEndpointId, boundEndpointName, {});
         break;
     }
     case ammod::audio_v2::AudioCoreRuntimeEvent::Active: {
@@ -1775,8 +1793,21 @@ void AudioCoreRuntimeEventCallback(void* context,
             std::to_wstring(format.containerBits) + L" sourceBits=" +
             std::to_wstring(sourceBits) + L" encoding=signed-int interleaved=1}");
         Log(L"audio core v2 active qpc=" + std::to_wstring(CurrentQpc()));
+
+        const auto activeEndpointId = runtime->CurrentEndpointId();
+        auto activeEndpointName = runtime->CurrentEndpointName();
+        if (activeEndpointName.empty() && !activeEndpointId.empty()) {
+            activeEndpointName = ammod::audio::GetDeviceNameFromId(activeEndpointId);
+        }
+        std::wostringstream formatStream;
+        formatStream << sourceBits << L"-bit / "
+                     << std::fixed << std::setprecision(1) << (format.sampleRate / 1000.0) << L" kHz";
+        if (runtime->Coordinator().Sink().Stats().lastError == S_OK) {
+            formatStream << L" (Bit-Perfect)";
+        }
         SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
-                       ammod::ipc::RuntimeState::Active, true);
+                       ammod::ipc::RuntimeState::Active, true,
+                       activeEndpointId, activeEndpointName, formatStream.str());
         break;
     }
     case ammod::audio_v2::AudioCoreRuntimeEvent::Faulted: {
@@ -3464,6 +3495,7 @@ DWORD WINAPI PipeClientLoop(void*) {
                 const auto hardwareBufferMs = incoming.hardwareBufferMs
                     ? incoming.hardwareBufferMs : 20u;
                 g_audioCoreRuntime.SetHardwareBufferMilliseconds(hardwareBufferMs);
+                g_audioCoreRuntime.SetTargetEndpoint(incoming.endpointId, incoming.endpointName);
                 g_ipcEnabled.store(enabled, std::memory_order_release);
                 if (!enabled) g_nativeP0Puller.DisableForUiOff();
                 g_audioCoreGate.SetUiEnabled(enabled);
@@ -3471,7 +3503,12 @@ DWORD WINAPI PipeClientLoop(void*) {
                 Log(L"broker status received enabled=" +
                     std::to_wstring(incoming.enabledIntent) + L" state=" +
                     std::to_wstring(static_cast<unsigned>(incoming.state)) +
-                    L" hardwareBufferMs=" + std::to_wstring(hardwareBufferMs));
+                    L" hardwareBufferMs=" + std::to_wstring(hardwareBufferMs) +
+                    L" endpoint=" + incoming.endpointId);
+            } else if (incoming.type == MessageType::SetOutputDevice) {
+                g_audioCoreRuntime.SetTargetEndpoint(incoming.endpointId, incoming.endpointName);
+                Log(L"broker output device received endpoint=" + std::wstring(incoming.endpointId) +
+                    L" name=" + std::wstring(incoming.endpointName));
             } else if (incoming.type == MessageType::TransportIntent) {
                 if (wcscmp(incoming.detail, L"play_pause") == 0) {
                     g_audioCoreRuntime.OnTransportPlayPause();

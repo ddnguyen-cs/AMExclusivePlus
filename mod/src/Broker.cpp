@@ -50,6 +50,28 @@ bool WriteHardwareBufferMs(std::uint32_t milliseconds) {
     return ReadHardwareBufferMs() == milliseconds;
 }
 
+std::wstring ReadTargetDeviceId() {
+    wchar_t value[kEndpointIdChars]{};
+    GetPrivateProfileStringW(L"mod", L"device_id", L"", value,
+        static_cast<DWORD>(std::size(value)), BrokerIniPath().c_str());
+    return value;
+}
+
+std::wstring ReadTargetDeviceName() {
+    wchar_t value[kEndpointNameChars]{};
+    GetPrivateProfileStringW(L"mod", L"device_name", L"", value,
+        static_cast<DWORD>(std::size(value)), BrokerIniPath().c_str());
+    return value;
+}
+
+bool WriteTargetDevice(const std::wstring& id, const std::wstring& name) {
+    const auto path = BrokerIniPath();
+    (void)WritePrivateProfileStringW(L"mod", L"device_id", id.c_str(), path.c_str());
+    (void)WritePrivateProfileStringW(L"mod", L"device_name", name.c_str(), path.c_str());
+    (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+    return true;
+}
+
 using namespace ammod::ipc;
 
 struct Client {
@@ -66,6 +88,10 @@ std::vector<Client> g_clients;
 Message g_status = [] {
     auto message = NewMessage(MessageType::StatusChanged, Role::Broker);
     message.state = RuntimeState::Off;
+    const auto id = ReadTargetDeviceId();
+    const auto name = ReadTargetDeviceName();
+    if (!id.empty()) wcsncpy_s(message.endpointId, id.c_str(), _TRUNCATE);
+    if (!name.empty()) wcsncpy_s(message.endpointName, name.c_str(), _TRUNCATE);
     return message;
 }();
 
@@ -675,10 +701,20 @@ void HandleMessage(const Message& incoming, HANDLE source) {
                         std::to_wstring(GetLastError()));
                 }
             }
+        } else if (incoming.type == MessageType::SetOutputDevice &&
+                   (incoming.role == Role::Ui || incoming.role == Role::Controller)) {
+            WriteTargetDevice(incoming.endpointId, incoming.endpointName);
+            g_status.generation++;
+            wcsncpy_s(g_status.endpointId, incoming.endpointId, _TRUNCATE);
+            wcsncpy_s(g_status.endpointName, incoming.endpointName, _TRUNCATE);
+            Log(L"output device persisted id=" + std::wstring(incoming.endpointId) +
+                L" name=" + std::wstring(incoming.endpointName));
         } else if (incoming.type == MessageType::StatusChanged) {
             const auto generation = std::max(g_status.generation + 1, incoming.generation);
             const auto persistedIntent = g_status.enabledIntent;
             const auto persistedHardwareBufferMs = g_status.hardwareBufferMs;
+            const auto persistedEndpointId = std::wstring(g_status.endpointId);
+            const auto persistedEndpointName = std::wstring(g_status.endpointName);
             g_status = incoming;
             g_status.type = MessageType::StatusChanged;
             g_status.role = Role::Broker;
@@ -690,6 +726,12 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             if (incoming.role == Role::Agent) {
                 g_status.enabledIntent = persistedIntent;
                 g_status.hardwareBufferMs = persistedHardwareBufferMs;
+                if (g_status.endpointId[0] == L'\0' && !persistedEndpointId.empty()) {
+                    wcsncpy_s(g_status.endpointId, persistedEndpointId.c_str(), _TRUNCATE);
+                }
+                if (g_status.endpointName[0] == L'\0' && !persistedEndpointName.empty()) {
+                    wcsncpy_s(g_status.endpointName, persistedEndpointName.c_str(), _TRUNCATE);
+                }
                 if (persistedIntent && incoming.state == RuntimeState::Off) {
                     g_status.state = RuntimeState::WaitingForStream;
                 }
@@ -698,11 +740,19 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             const auto generation = std::max(g_status.generation + 1, incoming.generation);
             const auto persistedIntent = g_status.enabledIntent;
             const auto persistedHardwareBufferMs = g_status.hardwareBufferMs;
+            const auto persistedEndpointId = std::wstring(g_status.endpointId);
+            const auto persistedEndpointName = std::wstring(g_status.endpointName);
             g_status = incoming;
             g_status.type = MessageType::StatusChanged;
             g_status.role = Role::Broker;
             g_status.generation = generation;
             g_status.hardwareBufferMs = persistedHardwareBufferMs;
+            if (g_status.endpointId[0] == L'\0' && !persistedEndpointId.empty()) {
+                wcsncpy_s(g_status.endpointId, persistedEndpointId.c_str(), _TRUNCATE);
+            }
+            if (g_status.endpointName[0] == L'\0' && !persistedEndpointName.empty()) {
+                wcsncpy_s(g_status.endpointName, persistedEndpointName.c_str(), _TRUNCATE);
+            }
             if (persistedIntent) {
                 // Retire the failed attempt, not the user's AME preference.
                 // The Agent receives this status and arms a fresh generation

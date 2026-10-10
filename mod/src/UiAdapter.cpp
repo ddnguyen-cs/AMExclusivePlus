@@ -1,6 +1,7 @@
 #include "BoundedLog.h"
 #include "IpcProtocol.h"
 #include "IpcTransport.h"
+#include "AudioDeviceUtils.h"
 
 #include <windows.h>
 
@@ -27,6 +28,7 @@
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -87,12 +89,22 @@ HWINEVENTHOOK g_windowLifecycleHook{};
 HWND g_mainWindow{};
 winrt::weak_ref<Controls::ToggleSwitch> g_toggle;
 winrt::weak_ref<Controls::TextBox> g_hardwareBufferBox;
+winrt::weak_ref<Controls::ComboBox> g_deviceComboBox;
+std::vector<winrt::weak_ref<Controls::Border>> g_sampleBadgeBorderList;
+std::vector<winrt::weak_ref<Controls::TextBlock>> g_sampleBadgeTextList;
+std::vector<winrt::weak_ref<Controls::Button>> g_nowPlayingDeviceBtnList;
+std::mutex g_pendingDeviceMutex;
+std::optional<std::pair<std::wstring, std::wstring>> g_pendingOutputDevice;
+std::atomic<bool> g_deviceSelectionUpdating{false};
 Microsoft::UI::Dispatching::DispatcherQueue g_dispatcher{nullptr};
 Microsoft::UI::Dispatching::DispatcherQueueTimer g_statusRefreshTimer{nullptr};
 
+void AttachNowPlayingWidgets(const Xaml::DependencyObject& content, const Xaml::Window& window);
 void AttachTransportObservers();
 void AttachOrRefreshToggle();
 void ScheduleTransportObserverAttach();
+void ApplyNowPlayingStatus();
+void EnsureDispatcherTimer(const Microsoft::UI::Dispatching::DispatcherQueue& currentDispatcher);
 LRESULT CALLBACK UiThreadHook(int code, WPARAM wParam, LPARAM lParam);
 
 bool ArmUiThreadRefresh(HWND window) {
@@ -246,6 +258,14 @@ bool SendHardwareBuffer(std::uint32_t milliseconds) {
     g_requestedHardwareBufferMs.store(static_cast<int>(milliseconds));
     g_pendingHardwareBufferMs.store(static_cast<int>(milliseconds));
     g_hardwareBufferAckDeadlineTick.store(0);
+    return true;
+}
+
+bool SendOutputDevice(const std::wstring& endpointId, const std::wstring& endpointName) {
+    {
+        std::lock_guard lock(g_pendingDeviceMutex);
+        g_pendingOutputDevice = std::make_pair(endpointId, endpointName);
+    }
     return true;
 }
 
@@ -685,6 +705,7 @@ void ApplyStatus(const Controls::ToggleSwitch& toggle) {
     if (status.state == RuntimeState::Active) {
         presentation = Localized(L"已启用", L"Enabled");
         if (status.endpointName[0]) presentation += L" · " + std::wstring(status.endpointName);
+        if (status.format[0]) presentation += L" · " + std::wstring(status.format);
     } else if (status.state == RuntimeState::DisablePending) {
         presentation = Localized(L"正在恢复共享输出…", L"Restoring shared output…");
     } else if (status.state == RuntimeState::Requested ||
@@ -750,11 +771,10 @@ void CommitHardwareBuffer(const Controls::TextBox& input) {
         std::to_wstring(milliseconds));
 }
 
-void RememberToggle(const Controls::ToggleSwitch& toggle) {
+void EnsureDispatcherTimer(const Microsoft::UI::Dispatching::DispatcherQueue& currentDispatcher) {
+    if (!currentDispatcher) return;
     std::lock_guard lock(g_uiTargetMutex);
-    g_toggle = make_weak(toggle);
-    auto current = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
-    g_dispatcher = current ? current : toggle.DispatcherQueue();
+    if (!g_dispatcher) g_dispatcher = currentDispatcher;
     if (!g_statusRefreshTimer && g_dispatcher) {
         g_statusRefreshTimer = g_dispatcher.CreateTimer();
         g_statusRefreshTimer.Interval(std::chrono::milliseconds(250));
@@ -762,17 +782,178 @@ void RememberToggle(const Controls::ToggleSwitch& toggle) {
         g_statusRefreshTimer.Tick([](auto&&, auto&&) {
             winrt::weak_ref<Controls::ToggleSwitch> target;
             winrt::weak_ref<Controls::TextBox> hardwareBuffer;
+            winrt::weak_ref<Controls::ComboBox> deviceBox;
             {
                 std::lock_guard targetLock(g_uiTargetMutex);
                 target = g_toggle;
                 hardwareBuffer = g_hardwareBufferBox;
+                deviceBox = g_deviceComboBox;
             }
             if (auto control = target.get()) ApplyStatus(control);
             if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
+            if (auto box = deviceBox.get()) ApplyDeviceStatus(box);
+            ApplyNowPlayingStatus();
         });
         g_statusRefreshTimer.Start();
         Log(L"UI status refresh timer started intervalMs=250");
     }
+}
+
+void PopulateDeviceComboBox(const Controls::ComboBox& box) {
+    if (!box) return;
+    box.Items().Clear();
+
+    Controls::ComboBoxItem defaultItem;
+    defaultItem.Content(box_value(hstring(Localized(L"[默认] 系统默认输出", L"[Default] System Default"))));
+    defaultItem.Tag(box_value(hstring(L"")));
+    box.Items().Append(defaultItem);
+
+    auto devices = ammod::audio::EnumerateOutputDevices();
+    for (const auto& dev : devices) {
+        Controls::ComboBoxItem item;
+        std::wstring label = dev.name;
+        if (dev.isDefault) {
+            label += Localized(L" (系统默认)", L" (System Default)");
+        }
+        item.Content(box_value(hstring(label)));
+        item.Tag(box_value(hstring(dev.id)));
+        box.Items().Append(item);
+    }
+}
+
+void ApplyDeviceStatus(const Controls::ComboBox& box) {
+    if (!box) return;
+    const auto status = StatusSnapshot();
+    const std::wstring targetId = status.endpointId;
+
+    uint32_t targetIndex = 0;
+    const auto size = box.Items().Size();
+    for (uint32_t i = 0; i < size; ++i) {
+        if (auto item = box.Items().GetAt(i).try_as<Controls::ComboBoxItem>()) {
+            if (auto tag = item.Tag().try_as<winrt::Windows::Foundation::IPropertyValue>()) {
+                if (tag.GetString() == targetId) {
+                    targetIndex = i;
+                    break;
+                }
+            }
+        }
+    }
+    if (box.SelectedIndex() != static_cast<int32_t>(targetIndex)) {
+        g_deviceSelectionUpdating.store(true);
+        box.SelectedIndex(static_cast<int32_t>(targetIndex));
+        g_deviceSelectionUpdating.store(false);
+    }
+}
+
+void RememberDeviceComboBox(const Controls::ComboBox& box) {
+    std::lock_guard lock(g_uiTargetMutex);
+    g_deviceComboBox = make_weak(box);
+    auto current = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+    EnsureDispatcherTimer(current ? current : box.DispatcherQueue());
+}
+
+Controls::MenuFlyout CreateDeviceFlyout() {
+    Controls::MenuFlyout flyout;
+    const auto status = StatusSnapshot();
+    const std::wstring currentId = status.endpointId;
+
+    Controls::MenuFlyoutItem defaultItem;
+    std::wstring defText = Localized(L"[默认] 系统默认输出", L"[Default] System Default");
+    if (currentId.empty()) {
+        defText = L"✓ " + defText;
+    }
+    defaultItem.Text(defText);
+    defaultItem.Click([](auto&&, auto&&) {
+        SendOutputDevice(L"", Localized(L"系统默认", L"System Default"));
+        ScheduleStatusRefresh();
+    });
+    flyout.Items().Append(defaultItem);
+
+    auto devices = ammod::audio::EnumerateOutputDevices();
+    for (const auto& dev : devices) {
+        Controls::MenuFlyoutItem item;
+        std::wstring itemText = dev.name;
+        if (!currentId.empty() && dev.id == currentId) {
+            itemText = L"✓ " + itemText;
+        }
+        item.Text(itemText);
+        item.Click([id = dev.id, name = dev.name](auto&&, auto&&) {
+            SendOutputDevice(id, name);
+            ScheduleStatusRefresh();
+        });
+        flyout.Items().Append(item);
+    }
+    return flyout;
+}
+
+void RememberNowPlayingControls(const Controls::Border& badgeBorder,
+                                const Controls::TextBlock& badgeText,
+                                const Controls::Button& deviceBtn) {
+    std::lock_guard lock(g_uiTargetMutex);
+    g_sampleBadgeBorderList.push_back(make_weak(badgeBorder));
+    g_sampleBadgeTextList.push_back(make_weak(badgeText));
+    g_nowPlayingDeviceBtnList.push_back(make_weak(deviceBtn));
+    auto current = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+    EnsureDispatcherTimer(current ? current : badgeBorder.DispatcherQueue());
+}
+
+void ApplyNowPlayingStatus() {
+    const auto status = StatusSnapshot();
+    const bool isExclusiveActive = (status.state == RuntimeState::Active);
+    const bool hasFormat = (status.format[0] != L'\0');
+
+    // Update Sample Badges
+    for (auto it = g_sampleBadgeBorderList.begin(); it != g_sampleBadgeBorderList.end(); ) {
+        if (auto border = it->get()) {
+            if (isExclusiveActive && hasFormat) {
+                border.Visibility(Xaml::Visibility::Visible);
+            } else if (status.enabledIntent != 0) {
+                border.Visibility(Xaml::Visibility::Visible);
+            } else {
+                border.Visibility(Xaml::Visibility::Collapsed);
+            }
+            ++it;
+        } else {
+            it = g_sampleBadgeBorderList.erase(it);
+        }
+    }
+
+    for (auto it = g_sampleBadgeTextList.begin(); it != g_sampleBadgeTextList.end(); ) {
+        if (auto text = it->get()) {
+            if (isExclusiveActive && hasFormat) {
+                text.Text(status.format);
+            } else if (status.enabledIntent != 0) {
+                text.Text(Localized(L"独占待命", L"Exclusive Armed"));
+            } else {
+                text.Text(L"");
+            }
+            ++it;
+        } else {
+            it = g_sampleBadgeTextList.erase(it);
+        }
+    }
+
+    // Update Now Playing Device Button tooltips
+    std::wstring devTooltip = Localized(L"音频输出 (WASAPI 独占): ", L"Audio Output (WASAPI Exclusive): ");
+    devTooltip += status.endpointName[0] ? status.endpointName : Localized(L"默认设备", L"Default Device");
+    if (isExclusiveActive && hasFormat) {
+        devTooltip += L"\n" + std::wstring(status.format);
+    }
+    for (auto it = g_nowPlayingDeviceBtnList.begin(); it != g_nowPlayingDeviceBtnList.end(); ) {
+        if (auto btn = it->get()) {
+            Controls::ToolTipService::SetToolTip(btn, box_value(hstring(devTooltip)));
+            ++it;
+        } else {
+            it = g_nowPlayingDeviceBtnList.erase(it);
+        }
+    }
+}
+
+void RememberToggle(const Controls::ToggleSwitch& toggle) {
+    std::lock_guard lock(g_uiTargetMutex);
+    g_toggle = make_weak(toggle);
+    auto current = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+    EnsureDispatcherTimer(current ? current : toggle.DispatcherQueue());
 }
 
 void RememberHardwareBufferBox(const Controls::TextBox& input) {
@@ -780,23 +961,27 @@ void RememberHardwareBufferBox(const Controls::TextBox& input) {
     if (!g_hardwareBufferBox.get()) g_hardwareBufferInputDirty.store(false);
     g_hardwareBufferBox = make_weak(input);
     auto current = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
-    if (!g_dispatcher) g_dispatcher = current ? current : input.DispatcherQueue();
+    EnsureDispatcherTimer(current ? current : input.DispatcherQueue());
 }
 
 void ScheduleStatusRefresh() {
     winrt::weak_ref<Controls::ToggleSwitch> toggle;
     winrt::weak_ref<Controls::TextBox> hardwareBuffer;
+    winrt::weak_ref<Controls::ComboBox> deviceBox;
     Microsoft::UI::Dispatching::DispatcherQueue dispatcher{nullptr};
     {
         std::lock_guard lock(g_uiTargetMutex);
         toggle = g_toggle;
         hardwareBuffer = g_hardwareBufferBox;
+        deviceBox = g_deviceComboBox;
         dispatcher = g_dispatcher;
     }
     if (dispatcher) {
-        dispatcher.TryEnqueue([toggle, hardwareBuffer] {
+        dispatcher.TryEnqueue([toggle, hardwareBuffer, deviceBox] {
             if (auto control = toggle.get()) ApplyStatus(control);
             if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
+            if (auto box = deviceBox.get()) ApplyDeviceStatus(box);
+            ApplyNowPlayingStatus();
         });
     }
 }
@@ -839,6 +1024,157 @@ void AttachTransportPopupLifecycle(const Primitives::Popup& popup) {
     });
 }
 
+void AttachNowPlayingWidgets(const Xaml::DependencyObject& content, const Xaml::Window& window) {
+    if (!content) return;
+    try {
+        if (auto existingCluster = FindByName(content, L"AMExclusiveNowPlayingCluster")) {
+            auto badgeBorder = FindByName(content, L"AMExclusiveSampleBadge").try_as<Controls::Border>();
+            auto badgeText = FindByName(content, L"AMExclusiveSampleBadgeText").try_as<Controls::TextBlock>();
+            auto deviceBtn = FindByName(content, L"AMExclusiveNowPlayingDeviceButton").try_as<Controls::Button>();
+            if (badgeBorder && badgeText && deviceBtn) {
+                RememberNowPlayingControls(badgeBorder, badgeText, deviceBtn);
+                ApplyNowPlayingStatus();
+            }
+            return;
+        }
+
+        // Search for candidate anchor elements in the transport bar
+        std::vector<Xaml::DependencyObject> anchorNodes;
+        CollectByName(content, L"VolumeMuteButton", anchorNodes);
+        CollectByAutomationId(content, L"VolumeMuteButton", anchorNodes);
+        CollectByName(content, L"VolumeControl", anchorNodes);
+        CollectByAutomationId(content, L"VolumeControl", anchorNodes);
+        CollectByName(content, L"VolumeSlider", anchorNodes);
+        CollectByAutomationId(content, L"VolumeSlider", anchorNodes);
+        CollectByName(content, L"AirPlayButton", anchorNodes);
+        CollectByAutomationId(content, L"AirPlayButton", anchorNodes);
+        if (anchorNodes.empty()) {
+            CollectByName(content, L"LCDScrubber", anchorNodes);
+            CollectByAutomationId(content, L"LCDScrubber", anchorNodes);
+        }
+        if (anchorNodes.empty()) {
+            CollectByName(content, L"TransportControl_PlayPauseStop", anchorNodes);
+            CollectByAutomationId(content, L"TransportControl_PlayPauseStop", anchorNodes);
+        }
+
+        if (anchorNodes.empty()) return;
+
+        Xaml::DependencyObject anchor = anchorNodes.front();
+        Controls::Panel hostPanel{nullptr};
+        Xaml::DependencyObject directChildInHost{nullptr};
+        auto current = anchor;
+        auto parent = Media::VisualTreeHelper::GetParent(current);
+        while (parent) {
+            if (auto p = parent.try_as<Controls::StackPanel>()) {
+                hostPanel = p;
+                directChildInHost = current;
+                break;
+            }
+            if (!hostPanel) {
+                if (auto p = parent.try_as<Controls::Panel>()) {
+                    hostPanel = p;
+                    directChildInHost = current;
+                }
+            }
+            current = parent;
+            parent = Media::VisualTreeHelper::GetParent(parent);
+        }
+        if (!hostPanel) return;
+
+        // Create Badge Border
+        Controls::Border badgeBorder;
+        badgeBorder.Name(L"AMExclusiveSampleBadge");
+        badgeBorder.CornerRadius(Xaml::CornerRadius{4, 4, 4, 4});
+        badgeBorder.Padding(Xaml::Thickness{6, 2, 6, 2});
+        badgeBorder.Margin(Xaml::Thickness{4, 0, 4, 0});
+        badgeBorder.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        if (auto bg = ThemeBrush(L"CardBackgroundFillColorDefaultBrush")) {
+            badgeBorder.Background(bg);
+        }
+        if (auto stroke = ThemeBrush(L"CardStrokeColorDefaultBrush")) {
+            badgeBorder.BorderBrush(stroke);
+        }
+        badgeBorder.BorderThickness(Xaml::Thickness{1, 1, 1, 1});
+
+        Controls::TextBlock badgeText;
+        badgeText.Name(L"AMExclusiveSampleBadgeText");
+        badgeText.FontSize(11.0);
+        badgeText.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        badgeText.TextAlignment(Xaml::TextAlignment::Center);
+        badgeBorder.Child(badgeText);
+
+        Controls::ToolTipService::SetToolTip(
+            badgeBorder,
+            box_value(hstring(Localized(L"当前音频输出格式与独占状态",
+                                        L"Current audio output format and exclusive status"))));
+
+        // Create Device Switcher Button
+        Controls::Button deviceBtn;
+        deviceBtn.Name(L"AMExclusiveNowPlayingDeviceButton");
+        deviceBtn.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        deviceBtn.Padding(Xaml::Thickness{6, 5, 6, 5});
+        deviceBtn.Margin(Xaml::Thickness{2, 0, 2, 0});
+        deviceBtn.BorderThickness(Xaml::Thickness{0, 0, 0, 0});
+        if (auto transparent = ThemeBrush(L"SubtleFillColorTransparentBrush")) {
+            deviceBtn.Background(transparent);
+        }
+
+        Controls::FontIcon icon;
+        icon.Glyph(L"\uE7F6"); // Volume / Speaker icon in Segoe Fluent Icons / MDL2
+        icon.FontSize(14.0);
+        deviceBtn.Content(icon);
+
+        Automation::AutomationProperties::SetName(
+            deviceBtn,
+            Localized(L"选择音频输出设备 (WASAPI 独占)", L"Select Audio Output Device (WASAPI Exclusive)"));
+
+        deviceBtn.Click([](auto&& sender, auto&&) {
+            if (auto btn = sender.try_as<Controls::Button>()) {
+                auto flyout = CreateDeviceFlyout();
+                flyout.ShowAt(btn);
+            }
+        });
+
+        // Assemble cluster
+        Controls::StackPanel cluster;
+        cluster.Name(L"AMExclusiveNowPlayingCluster");
+        cluster.Orientation(Controls::Orientation::Horizontal);
+        cluster.Spacing(4.0);
+        cluster.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        cluster.Children().Append(badgeBorder);
+        cluster.Children().Append(deviceBtn);
+
+        // Find index of anchor in hostPanel
+        uint32_t anchorIndex = 0;
+        bool foundAnchor = false;
+        const uint32_t count = hostPanel.Children().Size();
+        for (uint32_t i = 0; i < count; ++i) {
+            if (hostPanel.Children().GetAt(i) == directChildInHost) {
+                anchorIndex = i;
+                foundAnchor = true;
+                break;
+            }
+        }
+
+        if (foundAnchor) {
+            hostPanel.Children().InsertAt(anchorIndex, cluster);
+        } else {
+            hostPanel.Children().Append(cluster);
+        }
+
+        RememberNowPlayingControls(badgeBorder, badgeText, deviceBtn);
+        ApplyNowPlayingStatus();
+        Log(L"Now Playing audio sample badge and output device button attached to transport bar");
+    } catch (const hresult_error& error) {
+        std::wostringstream text;
+        text << L"Now Playing widgets attach failed hr=0x" << std::hex
+             << error.code().value << L" " << error.message().c_str();
+        Log(text.str());
+    } catch (...) {
+        Log(L"Now Playing widgets attach failed with unknown exception");
+    }
+}
+
 void AttachTransportObservers() {
     try {
         const auto windows = GetTransportXamlWindows();
@@ -847,6 +1183,7 @@ void AttachTransportObservers() {
             if (!content) continue;
             if (!get_abi(window)) continue;
             AttachTransportWindowLifecycle(window);
+            AttachNowPlayingWidgets(content, window);
 
             // Preserve the original MainWindow direct-selection behavior while
             // broadening discovery to every live transport presentation.
@@ -1053,6 +1390,11 @@ void AttachOrRefreshToggle() {
                                  .try_as<Controls::TextBox>()) {
                 RememberHardwareBufferBox(input);
                 ApplyHardwareBufferStatus(input);
+            }
+            if (auto devBox = FindByName(page, L"AMExclusiveDeviceComboBox")
+                                  .try_as<Controls::ComboBox>()) {
+                RememberDeviceComboBox(devBox);
+                ApplyDeviceStatus(devBox);
             }
             return;
         }
@@ -1290,6 +1632,81 @@ void AttachOrRefreshToggle() {
         }
         target.Children().Append(card);
 
+        Controls::TextBlock deviceTitle;
+        deviceTitle.Text(Localized(L"输出设备", L"Output Device"));
+        Controls::TextBlock deviceDescription;
+        deviceDescription.Text(Localized(
+            L"选择用于 WASAPI 独占输出的音频设备 / DAC。",
+            L"Select the audio device / DAC for WASAPI exclusive output."));
+        deviceDescription.TextWrapping(Xaml::TextWrapping::Wrap);
+        if (!nativeText.empty()) deviceTitle.Style(nativeText[0].Style());
+        if (nativeText.size() > 1) deviceDescription.Style(nativeText[1].Style());
+
+        Controls::StackPanel deviceLabels;
+        deviceLabels.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        deviceLabels.Children().Append(deviceTitle);
+        deviceLabels.Children().Append(deviceDescription);
+
+        Controls::ComboBox deviceBox;
+        deviceBox.Name(L"AMExclusiveDeviceComboBox");
+        deviceBox.MinWidth(220.0);
+        deviceBox.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        PopulateDeviceComboBox(deviceBox);
+        deviceBox.SelectionChanged([](auto&& sender, auto&&) {
+            if (g_deviceSelectionUpdating.load()) return;
+            if (auto cb = sender.try_as<Controls::ComboBox>()) {
+                if (cb.SelectedIndex() < 0) return;
+                if (auto selectedItem = cb.SelectedItem().try_as<Controls::ComboBoxItem>()) {
+                    std::wstring devId;
+                    std::wstring devName;
+                    if (auto tag = selectedItem.Tag().try_as<winrt::Windows::Foundation::IPropertyValue>()) {
+                        devId = tag.GetString().c_str();
+                    }
+                    if (auto content = selectedItem.Content().try_as<winrt::Windows::Foundation::IPropertyValue>()) {
+                        devName = content.GetString().c_str();
+                    }
+                    SendOutputDevice(devId, devName);
+                    ScheduleStatusRefresh();
+                }
+            }
+        });
+        deviceBox.DropDownOpened([](auto&& sender, auto&&) {
+            if (auto cb = sender.try_as<Controls::ComboBox>()) {
+                g_deviceSelectionUpdating.store(true);
+                PopulateDeviceComboBox(cb);
+                ApplyDeviceStatus(cb);
+                g_deviceSelectionUpdating.store(false);
+            }
+        });
+        Automation::AutomationProperties::SetName(
+            deviceBox, Localized(L"输出设备", L"Output Device"));
+
+        Controls::ColumnDefinition deviceLabelColumn;
+        deviceLabelColumn.Width(Xaml::GridLength{1.0, Xaml::GridUnitType::Star});
+        Controls::ColumnDefinition deviceBoxColumn;
+        deviceBoxColumn.Width(Xaml::GridLength{1.0, Xaml::GridUnitType::Auto});
+        Controls::Grid deviceContent;
+        deviceContent.ColumnDefinitions().Append(deviceLabelColumn);
+        deviceContent.ColumnDefinitions().Append(deviceBoxColumn);
+        deviceContent.Children().Append(deviceLabels);
+        Controls::Grid::SetColumn(deviceBox, 1);
+        deviceContent.Children().Append(deviceBox);
+
+        Controls::Border deviceCard;
+        deviceCard.Name(L"AMExclusiveDeviceCard");
+        deviceCard.Child(deviceContent);
+        deviceCard.Background(card.Background());
+        deviceCard.BorderBrush(card.BorderBrush());
+        deviceCard.BorderThickness(card.BorderThickness());
+        deviceCard.CornerRadius(card.CornerRadius());
+        deviceCard.Padding(card.Padding());
+        deviceCard.Margin(card.Margin());
+        deviceCard.HorizontalAlignment(card.HorizontalAlignment());
+        deviceCard.VerticalAlignment(card.VerticalAlignment());
+        deviceCard.MinHeight(card.MinHeight());
+        deviceCard.MaxWidth(card.MaxWidth());
+        target.Children().Append(deviceCard);
+
         Controls::TextBlock bufferTitle;
         bufferTitle.Text(Localized(L"硬件缓冲区", L"Hardware buffer"));
         Controls::TextBlock bufferDescription;
@@ -1364,10 +1781,13 @@ void AttachOrRefreshToggle() {
         target.Children().Append(bufferCard);
 
         RememberToggle(toggle);
+        RememberDeviceComboBox(deviceBox);
         RememberHardwareBufferBox(bufferInput);
         ApplyStatus(toggle);
+        ApplyDeviceStatus(deviceBox);
         ApplyHardwareBufferStatus(bufferInput);
         Log(L"Exclusive mode settings card attached to PlaybackSettingsPage");
+        Log(L"Output device settings card attached to PlaybackSettingsPage");
         Log(L"Hardware buffer settings card attached to PlaybackSettingsPage");
     } catch (const hresult_error& error) {
         std::wostringstream text;
@@ -1499,6 +1919,31 @@ DWORD WINAPI PipeThread(void*) {
                     break;
                 }
                 g_hardwareBufferAckDeadlineTick.store(GetTickCount64() + 1000);
+            }
+            std::optional<std::pair<std::wstring, std::wstring>> pendingDevice;
+            {
+                std::lock_guard lock(g_pendingDeviceMutex);
+                if (g_pendingOutputDevice.has_value()) {
+                    pendingDevice = g_pendingOutputDevice;
+                    g_pendingOutputDevice.reset();
+                }
+            }
+            if (pendingDevice.has_value()) {
+                auto message = NewMessage(MessageType::SetOutputDevice, Role::Ui);
+                message.uiPid = GetCurrentProcessId();
+                wcsncpy_s(message.endpointId, pendingDevice->first.c_str(), _TRUNCATE);
+                wcsncpy_s(message.endpointName, pendingDevice->second.c_str(), _TRUNCATE);
+                bool written{};
+                {
+                    std::lock_guard writeLock(g_pipeWriteMutex);
+                    written = WriteMessage(pipe, message);
+                }
+                if (!written) {
+                    std::lock_guard lock(g_pendingDeviceMutex);
+                    g_pendingOutputDevice = pendingDevice;
+                    break;
+                }
+                Log(L"SetOutputDevice message sent to broker: id=" + pendingDevice->first + L" name=" + pendingDevice->second);
             }
             if (!ReadMessageTimeout(pipe, incoming, 100)) {
                 if (GetLastError() == ERROR_TIMEOUT) {

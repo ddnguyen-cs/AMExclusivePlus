@@ -42,6 +42,7 @@ enum class MessageType : std::uint16_t {
     // `generation` carries the seek gesture epoch.
     TransportIntent = 9,
     SetHardwareBuffer = 10,
+    SetOutputDevice = 11,
 };
 
 enum class RuntimeState : std::uint16_t {

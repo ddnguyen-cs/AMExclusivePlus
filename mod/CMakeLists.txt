@@ -58,14 +58,14 @@ add_library(am_exclusive_hook SHARED
 target_include_directories(am_exclusive_hook PRIVATE
   src "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/rigtorp-SPSCQueue/include")
 target_compile_definitions(am_exclusive_hook PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(am_exclusive_hook PRIVATE minhook ole32 uuid advapi32 avrt)
+target_link_libraries(am_exclusive_hook PRIVATE minhook ole32 uuid advapi32 avrt propsys)
 set_target_properties(am_exclusive_hook PROPERTIES OUTPUT_NAME "am-exclusive-hook")
 
 add_library(am_exclusive_ui SHARED src/UiAdapter.cpp src/IpcTransport.cpp)
 add_dependencies(am_exclusive_ui generate_winui_projection)
 target_include_directories(am_exclusive_ui PRIVATE src "${WINRT_GENERATED_DIR}")
 target_compile_definitions(am_exclusive_ui PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(am_exclusive_ui PRIVATE advapi32 ole32 runtimeobject windowsapp)
+target_link_libraries(am_exclusive_ui PRIVATE advapi32 ole32 runtimeobject windowsapp propsys uuid)
 set_target_properties(am_exclusive_ui PROPERTIES OUTPUT_NAME "am-exclusive-ui")
 
 add_executable(am_exclusive_media_control src/MediaSessionControl.cpp)

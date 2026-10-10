@@ -120,6 +120,8 @@ Write-ProgressMilestone 32 'stop_runtime'
 
 $preservedMode = $null
 $preservedPeriod100ns = $null
+$preservedDeviceId = $null
+$preservedDeviceName = $null
 foreach ($existingIni in @(
     (Join-Path $install 'am-exclusive.ini')
 )) {
@@ -134,6 +136,12 @@ foreach ($existingIni in @(
                 $candidatePeriod -ge 10000 -and $candidatePeriod -le 1000000) {
                 $preservedPeriod100ns = $candidatePeriod
             }
+        }
+        if ($line -match '^\s*device_id\s*=\s*(.+?)\s*$') {
+            $preservedDeviceId = $Matches[1]
+        }
+        if ($line -match '^\s*device_name\s*=\s*(.+?)\s*$') {
+            $preservedDeviceName = $Matches[1]
         }
     }
     if ($preservedMode -and $preservedPeriod100ns) { break }
@@ -172,6 +180,22 @@ if ($preservedPeriod100ns) {
     $iniText = [IO.File]::ReadAllText($iniPath)
     $iniText = [Text.RegularExpressions.Regex]::Replace(
         $iniText, '(?m)^\s*period_100ns\s*=.*$', "period_100ns=$preservedPeriod100ns")
+    $utf8NoBom = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
+}
+if ($preservedDeviceId) {
+    $iniPath = Join-Path $install 'am-exclusive.ini'
+    $iniText = [IO.File]::ReadAllText($iniPath)
+    $iniText = [Text.RegularExpressions.Regex]::Replace(
+        $iniText, '(?m)^\s*device_id\s*=.*$', "device_id=$preservedDeviceId")
+    $utf8NoBom = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
+}
+if ($preservedDeviceName) {
+    $iniPath = Join-Path $install 'am-exclusive.ini'
+    $iniText = [IO.File]::ReadAllText($iniPath)
+    $iniText = [Text.RegularExpressions.Regex]::Replace(
+        $iniText, '(?m)^\s*device_name\s*=.*$', "device_name=$preservedDeviceName")
     $utf8NoBom = New-Object Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
 }

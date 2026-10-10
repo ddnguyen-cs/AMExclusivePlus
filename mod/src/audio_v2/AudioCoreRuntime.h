@@ -103,6 +103,10 @@ public:
     void Stop() noexcept;
     void SetUiEnabled(bool enabled) noexcept;
     void SetHardwareBufferMilliseconds(std::uint32_t milliseconds) noexcept;
+    void SetTargetEndpoint(const std::wstring& endpointId,
+                           const std::wstring& endpointName) noexcept;
+    std::wstring CurrentEndpointId() const noexcept;
+    std::wstring CurrentEndpointName() const noexcept;
     bool UiEnabled() const noexcept { return uiEnabled_.load(std::memory_order_acquire); }
 
     // UI transport intents are control-plane only. They gate when the exact
@@ -282,6 +286,8 @@ private:
     std::atomic<std::uint64_t> boundMediaGeneration_{};
     std::uint32_t requiredPrebufferFrames_{};
     std::wstring nativeEndpoint_;
+    std::wstring targetEndpointId_;
+    std::wstring targetEndpointName_;
     ULONGLONG nextTelemetryTick_{};
     // Read-only classifier snapshots continue while the UI switch is Off.
     // This is deliberately separate from the Active telemetry tick so an

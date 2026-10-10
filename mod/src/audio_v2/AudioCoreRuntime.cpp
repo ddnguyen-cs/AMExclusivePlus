@@ -183,6 +183,29 @@ void AudioCoreRuntime::SetHardwareBufferMilliseconds(std::uint32_t milliseconds)
     hardwareBufferMs_.store(milliseconds, std::memory_order_release);
 }
 
+void AudioCoreRuntime::SetTargetEndpoint(const std::wstring& endpointId,
+                                         const std::wstring& endpointName) noexcept {
+    std::lock_guard lock(controlMutex_);
+    if (targetEndpointId_ == endpointId && targetEndpointName_ == endpointName) return;
+    targetEndpointId_ = endpointId;
+    targetEndpointName_ = endpointName;
+    if (graphBound_) {
+        RetireCaptureLocked(true);
+        TryBindGraphLocked();
+    }
+    Wake();
+}
+
+std::wstring AudioCoreRuntime::CurrentEndpointId() const noexcept {
+    std::lock_guard lock(controlMutex_);
+    return targetEndpointId_.empty() ? nativeEndpoint_ : targetEndpointId_;
+}
+
+std::wstring AudioCoreRuntime::CurrentEndpointName() const noexcept {
+    std::lock_guard lock(controlMutex_);
+    return targetEndpointName_;
+}
+
 void AudioCoreRuntime::OnTransportPlayPause() noexcept {
     if (!UiEnabled()) return;
     std::lock_guard lock(controlMutex_);
@@ -1266,7 +1289,7 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
             PcmEncoding::SignedInteger, true,
             static_cast<std::uint16_t>(snapshot.registration.sourceBitDepth)};
     }
-    config.sink.endpointId = nativeEndpoint_;
+    config.sink.endpointId = targetEndpointId_.empty() ? nativeEndpoint_ : targetEndpointId_;
     config.sink.periodFrames = PeriodFrames(format.sampleRate);
     config.sink.alignmentRetries = 3;
     config.sink.lifecycleContext = callbacks_.context;
