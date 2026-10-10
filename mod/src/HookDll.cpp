@@ -3243,13 +3243,42 @@ HRESULT V2ResumeNativeGraphAfterFailedHandoff(void*, void* unit) noexcept {
     return result;
 }
 
+std::wstring g_cachedDeviceId;
+std::wstring g_cachedDeviceName;
+std::mutex g_cachedDeviceMutex;
+
+void UpdateConfiguredDeviceId(const std::wstring& id, const std::wstring& name) {
+    {
+        std::lock_guard lock(g_cachedDeviceMutex);
+        g_cachedDeviceId = id;
+        g_cachedDeviceName = name;
+    }
+    if (!g_iniPath.empty()) {
+        WritePrivateProfileStringW(L"mod", L"device_id", id.c_str(), g_iniPath.c_str());
+        WritePrivateProfileStringW(L"mod", L"device_name", name.c_str(), g_iniPath.c_str());
+        WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_iniPath.c_str());
+    }
+}
+
 std::wstring ReadConfiguredDeviceId() {
+    {
+        std::lock_guard lock(g_cachedDeviceMutex);
+        if (!g_cachedDeviceId.empty()) {
+            return g_cachedDeviceId;
+        }
+    }
     wchar_t id[ammod::ipc::kEndpointIdChars]{};
     GetPrivateProfileStringW(L"mod", L"device_id", L"", id, static_cast<DWORD>(std::size(id)), g_iniPath.c_str());
     return id;
 }
 
 std::wstring ReadConfiguredDeviceName() {
+    {
+        std::lock_guard lock(g_cachedDeviceMutex);
+        if (!g_cachedDeviceName.empty()) {
+            return g_cachedDeviceName;
+        }
+    }
     wchar_t name[ammod::ipc::kEndpointNameChars]{};
     GetPrivateProfileStringW(L"mod", L"device_name", L"", name, static_cast<DWORD>(std::size(name)), g_iniPath.c_str());
     return name;
@@ -3269,6 +3298,94 @@ std::uint64_t ReadConfiguredPeriod100ns() {
     return (period >= 10000 && period <= 1000000) ? period : 200000;
 }
 
+using RegisterEndpointNotificationCallbackFn = HRESULT(STDMETHODCALLTYPE*)(IMMDeviceEnumerator*, IMMNotificationClient*);
+using UnregisterEndpointNotificationCallbackFn = HRESULT(STDMETHODCALLTYPE*)(IMMDeviceEnumerator*, IMMNotificationClient*);
+RegisterEndpointNotificationCallbackFn g_v2OriginalRegisterEndpointNotificationCallback = nullptr;
+UnregisterEndpointNotificationCallbackFn g_v2OriginalUnregisterEndpointNotificationCallback = nullptr;
+
+std::mutex g_notificationClientsMutex;
+std::vector<IMMNotificationClient*> g_notificationClients;
+
+HRESULT STDMETHODCALLTYPE HookV2RegisterEndpointNotificationCallback(
+    IMMDeviceEnumerator* self, IMMNotificationClient* pClient) {
+    const auto result = g_v2OriginalRegisterEndpointNotificationCallback
+        ? g_v2OriginalRegisterEndpointNotificationCallback(self, pClient) : E_UNEXPECTED;
+    if (SUCCEEDED(result) && pClient) {
+        std::lock_guard lock(g_notificationClientsMutex);
+        if (std::find(g_notificationClients.begin(), g_notificationClients.end(), pClient) == g_notificationClients.end()) {
+            pClient->AddRef();
+            g_notificationClients.push_back(pClient);
+            Log(L"Registered IMMNotificationClient callback: count=" + std::to_wstring(g_notificationClients.size()));
+        }
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookV2UnregisterEndpointNotificationCallback(
+    IMMDeviceEnumerator* self, IMMNotificationClient* pClient) {
+    if (pClient) {
+        std::lock_guard lock(g_notificationClientsMutex);
+        auto it = std::find(g_notificationClients.begin(), g_notificationClients.end(), pClient);
+        if (it != g_notificationClients.end()) {
+            (*it)->Release();
+            g_notificationClients.erase(it);
+            Log(L"Unregistered IMMNotificationClient callback: count=" + std::to_wstring(g_notificationClients.size()));
+        }
+    }
+    return g_v2OriginalUnregisterEndpointNotificationCallback
+        ? g_v2OriginalUnregisterEndpointNotificationCallback(self, pClient) : E_UNEXPECTED;
+}
+
+void NotifyDeviceChanged(const wchar_t* endpointId) {
+    std::wstring devId = endpointId ? endpointId : L"";
+    if (devId.empty()) {
+        IMMDeviceEnumerator* enumerator = nullptr;
+        if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                       __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator))) && enumerator) {
+            IMMDevice* defDev = nullptr;
+            if (SUCCEEDED(g_v2OriginalGetDefaultEndpoint ? g_v2OriginalGetDefaultEndpoint(enumerator, eRender, eConsole, &defDev)
+                                                         : enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &defDev)) && defDev) {
+                LPWSTR pId = nullptr;
+                if (SUCCEEDED(defDev->GetId(&pId)) && pId) {
+                    devId = pId;
+                    CoTaskMemFree(pId);
+                }
+                defDev->Release();
+            }
+            enumerator->Release();
+        }
+    }
+    std::vector<IMMNotificationClient*> clients;
+    {
+        std::lock_guard lock(g_notificationClientsMutex);
+        clients = g_notificationClients;
+    }
+    Log(L"NotifyDeviceChanged: notifying " + std::to_wstring(clients.size()) +
+        L" clients for endpoint=" + devId);
+    for (auto* client : clients) {
+        if (client) {
+            try {
+                client->OnDefaultDeviceChanged(eRender, eConsole, devId.c_str());
+                client->OnDefaultDeviceChanged(eRender, eMultimedia, devId.c_str());
+            } catch (...) {
+                Log(L"Exception in OnDefaultDeviceChanged callback");
+            }
+        }
+    }
+}
+
+struct ExclusiveClientInfo {
+    WORD channels{2};
+    WORD validBits{32};
+    DWORD sampleRate{0};
+    bool needsFloatConversion{false};
+};
+
+std::mutex g_exclusiveClientsMutex;
+std::unordered_map<IAudioClient*, ExclusiveClientInfo> g_exclusiveClients;
+std::unordered_map<IAudioRenderClient*, ExclusiveClientInfo> g_exclusiveRenderClients;
+std::unordered_map<IAudioRenderClient*, BYTE*> g_exclusiveActiveBuffers;
+
 using AudioClientInitializeFn = HRESULT(STDMETHODCALLTYPE*)(
     IAudioClient* self,
     AUDCLNT_SHAREMODE shareMode,
@@ -3278,7 +3395,172 @@ using AudioClientInitializeFn = HRESULT(STDMETHODCALLTYPE*)(
     const WAVEFORMATEX* pFormat,
     LPCGUID AudioSessionGuid);
 
+using AudioClientGetMixFormatFn = HRESULT(STDMETHODCALLTYPE*)(IAudioClient*, WAVEFORMATEX**);
+using AudioClientGetServiceFn = HRESULT(STDMETHODCALLTYPE*)(IAudioClient*, REFIID, void**);
+using RenderClientGetBufferFn = HRESULT(STDMETHODCALLTYPE*)(IAudioRenderClient*, UINT32, BYTE**);
+using RenderClientReleaseBufferFn = HRESULT(STDMETHODCALLTYPE*)(IAudioRenderClient*, UINT32, DWORD);
+
 AudioClientInitializeFn g_originalAudioClientInitialize = nullptr;
+AudioClientGetMixFormatFn g_originalAudioClientGetMixFormat = nullptr;
+AudioClientGetServiceFn g_originalAudioClientGetService = nullptr;
+RenderClientGetBufferFn g_originalRenderClientGetBuffer = nullptr;
+RenderClientReleaseBufferFn g_originalRenderClientReleaseBuffer = nullptr;
+
+void ConvertFloatToPcmInPlace(BYTE* pBuffer, UINT32 numFrames, WORD channels, WORD validBits) noexcept {
+    if (!pBuffer || numFrames == 0 || channels == 0) return;
+    float* src = reinterpret_cast<float*>(pBuffer);
+    int32_t* dst = reinterpret_cast<int32_t*>(pBuffer);
+    const size_t totalSamples = static_cast<size_t>(numFrames) * channels;
+
+    if (validBits == 24) {
+        // 24-bit PCM inside 32-bit container (MSB aligned: shifted left 8 bits)
+        for (size_t i = 0; i < totalSamples; ++i) {
+            float f = src[i];
+            if (f > 1.0f) f = 1.0f;
+            else if (f < -1.0f) f = -1.0f;
+            dst[i] = static_cast<int32_t>(f * 8388607.0f) << 8;
+        }
+    } else {
+        // Full 32-bit integer PCM
+        for (size_t i = 0; i < totalSamples; ++i) {
+            float f = src[i];
+            if (f > 1.0f) f = 1.0f;
+            else if (f < -1.0f) f = -1.0f;
+            dst[i] = static_cast<int32_t>(f * 2147483647.0f);
+        }
+    }
+}
+
+HRESULT STDMETHODCALLTYPE HookRenderClientGetBuffer(
+    IAudioRenderClient* self, UINT32 numFramesRequested, BYTE** ppData) {
+    const auto result = g_originalRenderClientGetBuffer
+        ? g_originalRenderClientGetBuffer(self, numFramesRequested, ppData) : E_UNEXPECTED;
+    if (SUCCEEDED(result) && ppData && *ppData) {
+        std::lock_guard lock(g_exclusiveClientsMutex);
+        g_exclusiveActiveBuffers[self] = *ppData;
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookRenderClientReleaseBuffer(
+    IAudioRenderClient* self, UINT32 numFramesWritten, DWORD flags) {
+    if (!g_originalRenderClientReleaseBuffer) return E_UNEXPECTED;
+
+    BYTE* pBuffer = nullptr;
+    ExclusiveClientInfo info{};
+    bool shouldConvert = false;
+
+    {
+        std::lock_guard lock(g_exclusiveClientsMutex);
+        auto itBuf = g_exclusiveActiveBuffers.find(self);
+        if (itBuf != g_exclusiveActiveBuffers.end()) {
+            pBuffer = itBuf->second;
+        }
+        auto itClient = g_exclusiveRenderClients.find(self);
+        if (itClient != g_exclusiveRenderClients.end()) {
+            info = itClient->second;
+            shouldConvert = info.needsFloatConversion;
+        }
+    }
+
+    if (shouldConvert && pBuffer && numFramesWritten > 0 && !(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+        ConvertFloatToPcmInPlace(pBuffer, numFramesWritten, info.channels, info.validBits);
+    }
+
+    return g_originalRenderClientReleaseBuffer(self, numFramesWritten, flags);
+}
+
+HRESULT STDMETHODCALLTYPE HookAudioClientGetService(
+    IAudioClient* self, REFIID iid, void** object) {
+    const auto result = g_originalAudioClientGetService
+        ? g_originalAudioClientGetService(self, iid, object) : E_UNEXPECTED;
+    if (FAILED(result) || !object || !*object) return result;
+
+    if (iid == __uuidof(IAudioRenderClient)) {
+        auto* renderClient = reinterpret_cast<IAudioRenderClient*>(*object);
+        bool isExclusive = false;
+        ExclusiveClientInfo info{};
+
+        {
+            std::lock_guard lock(g_exclusiveClientsMutex);
+            auto it = g_exclusiveClients.find(self);
+            if (it != g_exclusiveClients.end()) {
+                isExclusive = true;
+                info = it->second;
+                g_exclusiveRenderClients[renderClient] = info;
+            }
+        }
+
+        if (isExclusive && info.needsFloatConversion) {
+            auto** table = Vtable(renderClient);
+            if (table) {
+                if (table[3]) {
+                    HookAddress(table[3], reinterpret_cast<void*>(&HookRenderClientGetBuffer),
+                                g_originalRenderClientGetBuffer, L"IAudioRenderClient::GetBuffer");
+                }
+                if (table[4]) {
+                    HookAddress(table[4], reinterpret_cast<void*>(&HookRenderClientReleaseBuffer),
+                                g_originalRenderClientReleaseBuffer, L"IAudioRenderClient::ReleaseBuffer");
+                }
+            }
+        }
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookAudioClientGetMixFormat(IAudioClient* self, WAVEFORMATEX** ppDeviceFormat) {
+    const auto result = g_originalAudioClientGetMixFormat
+        ? g_originalAudioClientGetMixFormat(self, ppDeviceFormat) : E_UNEXPECTED;
+    if (FAILED(result) || !ppDeviceFormat || !*ppDeviceFormat) return result;
+
+    try {
+        std::wstring mode = ReadConfiguredMode();
+        bool wantExclusive = (_wcsicmp(mode.c_str(), L"exclusive") == 0) || g_ipcEnabled.load(std::memory_order_acquire);
+        if (wantExclusive) {
+            uint32_t trackRate = ammod::quality::GetLastObservedTrackSampleRate();
+            if (trackRate > 0 && trackRate != (*ppDeviceFormat)->nSamplesPerSec) {
+                // Test whether the DAC exclusive mode supports this native track sample rate
+                WAVEFORMATEXTENSIBLE pcmTest{};
+                pcmTest.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+                pcmTest.Format.nChannels = (*ppDeviceFormat)->nChannels;
+                pcmTest.Format.nSamplesPerSec = trackRate;
+                pcmTest.Format.wBitsPerSample = 32;
+                pcmTest.Format.nBlockAlign = (pcmTest.Format.nChannels * 32) / 8;
+                pcmTest.Format.nAvgBytesPerSec = trackRate * pcmTest.Format.nBlockAlign;
+                pcmTest.Format.cbSize = 22;
+                pcmTest.Samples.wValidBitsPerSample = 32;
+                pcmTest.dwChannelMask = (pcmTest.Format.nChannels == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : 0;
+                pcmTest.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+
+                HRESULT hrTest = self->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, (WAVEFORMATEX*)&pcmTest, nullptr);
+                if (FAILED(hrTest)) {
+                    pcmTest.Samples.wValidBitsPerSample = 24;
+                    hrTest = self->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, (WAVEFORMATEX*)&pcmTest, nullptr);
+                }
+                if (FAILED(hrTest)) {
+                    WAVEFORMATEXTENSIBLE fltTest = pcmTest;
+                    fltTest.Samples.wValidBitsPerSample = 32;
+                    fltTest.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+                    hrTest = self->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, (WAVEFORMATEX*)&fltTest, nullptr);
+                }
+
+                if (SUCCEEDED(hrTest)) {
+                    Log(L"GetMixFormat: updated sample rate from " +
+                        std::to_wstring((*ppDeviceFormat)->nSamplesPerSec) +
+                        L" Hz to native track rate " + std::to_wstring(trackRate) + L" Hz");
+                    (*ppDeviceFormat)->nSamplesPerSec = trackRate;
+                    (*ppDeviceFormat)->nAvgBytesPerSec = trackRate * (*ppDeviceFormat)->nBlockAlign;
+                } else {
+                    Log(L"GetMixFormat: DAC exclusive mode does not support track rate " +
+                        std::to_wstring(trackRate) + L" Hz, keeping " +
+                        std::to_wstring((*ppDeviceFormat)->nSamplesPerSec) + L" Hz");
+                }
+            }
+        }
+    } catch (...) {}
+
+    return result;
+}
 
 HRESULT STDMETHODCALLTYPE HookAudioClientInitialize(
     IAudioClient* self,
@@ -3321,8 +3603,94 @@ HRESULT STDMETHODCALLTYPE HookAudioClientInitialize(
 
         if (wantExclusive && pFormat) {
             Log(L"Attempting WASAPI Exclusive Mode initialization...");
-            HRESULT hrFormat = self->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, pFormat, nullptr);
-            if (SUCCEEDED(hrFormat)) {
+
+            bool isCallerFloat = false;
+            if (pFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+                isCallerFloat = true;
+            } else if (pFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE && pFormat->cbSize >= 22) {
+                auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(pFormat);
+                if (ext->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) {
+                    isCallerFloat = true;
+                }
+            }
+
+            struct Candidate {
+                WAVEFORMATEXTENSIBLE wfx;
+                WORD validBits;
+                bool isFloat;
+                const wchar_t* name;
+            };
+
+            std::vector<Candidate> candidates;
+
+            // 1. Direct Float (if caller is float and driver supports exclusive float)
+            if (isCallerFloat) {
+                Candidate c{};
+                if (pFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE && pFormat->cbSize >= 22) {
+                    c.wfx = *reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(pFormat);
+                } else {
+                    c.wfx.Format = *pFormat;
+                    c.wfx.Format.cbSize = 22;
+                    c.wfx.Samples.wValidBitsPerSample = pFormat->wBitsPerSample;
+                    c.wfx.dwChannelMask = (pFormat->nChannels == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : 0;
+                    c.wfx.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+                }
+                c.validBits = c.wfx.Samples.wValidBitsPerSample ? c.wfx.Samples.wValidBitsPerSample : 32;
+                c.isFloat = true;
+                c.name = L"32-bit Float";
+                candidates.push_back(c);
+            }
+
+            // 2. 32-bit container / 32 valid bits PCM
+            {
+                Candidate c{};
+                c.wfx.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+                c.wfx.Format.nChannels = pFormat->nChannels;
+                c.wfx.Format.nSamplesPerSec = pFormat->nSamplesPerSec;
+                c.wfx.Format.wBitsPerSample = 32;
+                c.wfx.Format.nBlockAlign = (c.wfx.Format.nChannels * 32) / 8;
+                c.wfx.Format.nAvgBytesPerSec = c.wfx.Format.nSamplesPerSec * c.wfx.Format.nBlockAlign;
+                c.wfx.Format.cbSize = 22;
+                c.wfx.Samples.wValidBitsPerSample = 32;
+                c.dwChannelMask = (pFormat->nChannels == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : 0;
+                c.wfx.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+                c.validBits = 32;
+                c.isFloat = false;
+                c.name = L"32-bit Integer PCM (32 valid)";
+                candidates.push_back(c);
+            }
+
+            // 3. 32-bit container / 24 valid bits PCM (MSB aligned)
+            {
+                Candidate c{};
+                c.wfx.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+                c.wfx.Format.nChannels = pFormat->nChannels;
+                c.wfx.Format.nSamplesPerSec = pFormat->nSamplesPerSec;
+                c.wfx.Format.wBitsPerSample = 32;
+                c.wfx.Format.nBlockAlign = (c.wfx.Format.nChannels * 32) / 8;
+                c.wfx.Format.nAvgBytesPerSec = c.wfx.Format.nSamplesPerSec * c.wfx.Format.nBlockAlign;
+                c.wfx.Format.cbSize = 22;
+                c.wfx.Samples.wValidBitsPerSample = 24;
+                c.wfx.dwChannelMask = (pFormat->nChannels == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : 0;
+                c.wfx.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+                c.validBits = 24;
+                c.isFloat = false;
+                c.name = L"24-bit Integer PCM (32-bit container)";
+                candidates.push_back(c);
+            }
+
+            const Candidate* winner = nullptr;
+            for (const auto& cand : candidates) {
+                HRESULT hrTest = self->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                                        (const WAVEFORMATEX*)&cand.wfx, nullptr);
+                Log(L"Testing exclusive format " + std::wstring(cand.name) + L": hr=" + HResultText(hrTest));
+                if (SUCCEEDED(hrTest)) {
+                    winner = &cand;
+                    break;
+                }
+            }
+
+            if (winner) {
                 REFERENCE_TIME requestedPeriod = period100ns ? static_cast<REFERENCE_TIME>(period100ns) : 200000;
                 REFERENCE_TIME devDefaultPeriod = 0, devMinPeriod = 0;
                 if (SUCCEEDED(self->GetDevicePeriod(&devDefaultPeriod, &devMinPeriod)) && devMinPeriod > 0) {
@@ -3331,24 +3699,49 @@ HRESULT STDMETHODCALLTYPE HookAudioClientInitialize(
 
                 DWORD exclFlags = streamFlags;
                 REFERENCE_TIME bufferDuration = requestedPeriod;
-                REFERENCE_TIME periodicity = (exclFlags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) ? requestedPeriod : 0;
+                REFERENCE_TIME periodicity = requestedPeriod;
 
                 HRESULT hrExcl = g_originalAudioClientInitialize(
                     self, AUDCLNT_SHAREMODE_EXCLUSIVE, exclFlags,
-                    bufferDuration, periodicity, pFormat, AudioSessionGuid);
+                    bufferDuration, periodicity, (const WAVEFORMATEX*)&winner->wfx, AudioSessionGuid);
+
+                if (FAILED(hrExcl) && hrExcl == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+                    UINT32 frames = static_cast<UINT32>((requestedPeriod * winner->wfx.Format.nSamplesPerSec) / 10000000);
+                    REFERENCE_TIME alignedPeriod = static_cast<REFERENCE_TIME>((static_cast<double>(frames) / winner->wfx.Format.nSamplesPerSec) * 10000000.0 + 0.5);
+                    Log(L"Aligning buffer period to " + std::to_wstring(alignedPeriod) + L" (was " + std::to_wstring(requestedPeriod) + L")");
+                    hrExcl = g_originalAudioClientInitialize(
+                        self, AUDCLNT_SHAREMODE_EXCLUSIVE, exclFlags,
+                        alignedPeriod, alignedPeriod, (const WAVEFORMATEX*)&winner->wfx, AudioSessionGuid);
+                }
 
                 if (SUCCEEDED(hrExcl)) {
-                    std::wstring displayFormat = formatStr + L" (Exclusive Bit-Perfect)";
-                    Log(L"WASAPI Exclusive Mode SUCCEEDED: " + displayFormat);
+                    ExclusiveClientInfo info{};
+                    info.channels = winner->wfx.Format.nChannels;
+                    info.validBits = winner->validBits;
+                    info.sampleRate = winner->wfx.Format.nSamplesPerSec;
+                    info.needsFloatConversion = (isCallerFloat && !winner->isFloat);
+
+                    {
+                        std::lock_guard lock(g_exclusiveClientsMutex);
+                        g_exclusiveClients[self] = info;
+                    }
+
+                    std::wostringstream ss;
+                    ss << winner->validBits << L"-bit / " << std::fixed << std::setprecision(1)
+                       << (winner->wfx.Format.nSamplesPerSec / 1000.0) << L" kHz ("
+                       << winner->wfx.Format.nChannels << L" ch) (Exclusive Bit-Perfect)";
+                    std::wstring displayFormat = ss.str();
+                    Log(L"WASAPI Exclusive Mode SUCCEEDED: " + displayFormat +
+                        (info.needsFloatConversion ? L" [Float->PCM conversion active]" : L""));
                     SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
                                    ammod::ipc::RuntimeState::Active,
                                    true, targetId, targetName, displayFormat, S_OK);
                     return S_OK;
                 } else {
-                    Log(L"WASAPI Exclusive Mode failed (hr=" + HResultText(hrExcl) + L"), falling back gracefully to Shared Mode");
+                    Log(L"WASAPI Exclusive Mode Initialize failed (hr=" + HResultText(hrExcl) + L"), falling back to Shared Mode");
                 }
             } else {
-                Log(L"Format not supported in exclusive mode (hr=" + HResultText(hrFormat) + L"), falling back gracefully to Shared Mode");
+                Log(L"No supported exclusive format candidate found for DAC, falling back to Shared Mode");
             }
         }
 
@@ -3383,9 +3776,19 @@ HRESULT STDMETHODCALLTYPE HookV2DeviceActivate(IMMDevice* self, REFIID iid, DWOR
 
     if (iid == __uuidof(IAudioClient) || iid == __uuidof(IAudioClient2) || iid == __uuidof(IAudioClient3)) {
         auto** table = Vtable(reinterpret_cast<IUnknown*>(*object));
-        if (table && table[3]) {
-            HookAddress(table[3], reinterpret_cast<void*>(&HookAudioClientInitialize),
-                        g_originalAudioClientInitialize, L"IAudioClient::Initialize");
+        if (table) {
+            if (table[3]) {
+                HookAddress(table[3], reinterpret_cast<void*>(&HookAudioClientInitialize),
+                            g_originalAudioClientInitialize, L"IAudioClient::Initialize");
+            }
+            if (table[8]) {
+                HookAddress(table[8], reinterpret_cast<void*>(&HookAudioClientGetMixFormat),
+                            g_originalAudioClientGetMixFormat, L"IAudioClient::GetMixFormat");
+            }
+            if (table[14]) {
+                HookAddress(table[14], reinterpret_cast<void*>(&HookAudioClientGetService),
+                            g_originalAudioClientGetService, L"IAudioClient::GetService");
+            }
         }
     }
     return result;
@@ -3462,6 +3865,10 @@ void HookV2Enumerator(IMMDeviceEnumerator* enumerator) {
                 g_v2OriginalGetDefaultEndpoint, L"IMMDeviceEnumerator::GetDefaultAudioEndpoint [v2]");
     HookAddress(table[5], reinterpret_cast<void*>(&HookV2GetDevice),
                 g_v2OriginalGetDevice, L"IMMDeviceEnumerator::GetDevice [v2]");
+    HookAddress(table[6], reinterpret_cast<void*>(&HookV2RegisterEndpointNotificationCallback),
+                g_v2OriginalRegisterEndpointNotificationCallback, L"IMMDeviceEnumerator::RegisterEndpointNotificationCallback [v2]");
+    HookAddress(table[7], reinterpret_cast<void*>(&HookV2UnregisterEndpointNotificationCallback),
+                g_v2OriginalUnregisterEndpointNotificationCallback, L"IMMDeviceEnumerator::UnregisterEndpointNotificationCallback [v2]");
 }
 
 HRESULT WINAPI HookV2CoCreateInstance(REFCLSID clsid, LPUNKNOWN outer, DWORD context,
@@ -3577,6 +3984,13 @@ DWORD WINAPI PipeClientLoop(void*) {
                 if (!enabled) g_nativeP0Puller.DisableForUiOff();
                 g_audioCoreGate.SetUiEnabled(enabled);
                 g_audioCoreRuntime.SetUiEnabled(enabled);
+                if (incoming.endpointId[0] != L'\0') {
+                    std::wstring currentTarget = ReadConfiguredDeviceId();
+                    if (_wcsicmp(currentTarget.c_str(), incoming.endpointId) != 0) {
+                        UpdateConfiguredDeviceId(incoming.endpointId, incoming.endpointName);
+                        NotifyDeviceChanged(incoming.endpointId);
+                    }
+                }
                 Log(L"broker status received enabled=" +
                     std::to_wstring(incoming.enabledIntent) + L" state=" +
                     std::to_wstring(static_cast<unsigned>(incoming.state)) +
@@ -3584,6 +3998,8 @@ DWORD WINAPI PipeClientLoop(void*) {
                     L" endpoint=" + incoming.endpointId);
             } else if (incoming.type == MessageType::SetOutputDevice) {
                 g_audioCoreRuntime.SetTargetEndpoint(incoming.endpointId, incoming.endpointName);
+                UpdateConfiguredDeviceId(incoming.endpointId, incoming.endpointName);
+                NotifyDeviceChanged(incoming.endpointId);
                 Log(L"broker output device received endpoint=" + std::wstring(incoming.endpointId) +
                     L" name=" + std::wstring(incoming.endpointName));
             } else if (incoming.type == MessageType::TransportIntent) {

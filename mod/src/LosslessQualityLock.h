@@ -11,6 +11,7 @@ using LogFunction = void(*)(const std::wstring&);
 
 bool Install(HMODULE coreMedia, HMODULE coreFoundation, LogFunction log);
 void SetEnabled(bool enabled) noexcept;
+std::uint32_t GetLastObservedTrackSampleRate() noexcept;
 std::int32_t CreateStrictLosslessFilter(SubtypeFactory factory, void* allocator,
                                         void* allowedSubtypes, std::uint16_t tier,
                                         void** output);

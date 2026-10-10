@@ -48,6 +48,7 @@ bool installed{};
 std::atomic<bool> enabled{};
 std::atomic<std::uint64_t> policyGeneration{1};
 std::atomic<bool> hasStrictFilters{};
+std::atomic<std::uint32_t> g_lastObservedTrackSampleRate{0};
 thread_local bool creatingStrictFilter{};
 thread_local bool wrappedStrictFilter{};
 thread_local std::uint16_t creatingStrictTier{};
@@ -158,6 +159,7 @@ void __cdecl Observe(void* alternate, void* context, void* filter) {
         const LONG actual = InterlockedCompareExchange(&evaluation.bestRate,
             static_cast<LONG>(candidate.bestRate), previous);
         if (actual != previous) { previous = actual; continue; }
+        g_lastObservedTrackSampleRate.store(candidate.bestRate, std::memory_order_relaxed);
         if (writeLog) {
             writeLog(L"Strict ALAC quality filter=" +
                 std::to_wstring(reinterpret_cast<std::uintptr_t>(filter)) +
@@ -382,6 +384,10 @@ void SetEnabled(bool value) noexcept {
     if (previous != value) {
         policyGeneration.fetch_add(1, std::memory_order_acq_rel);
     }
+}
+
+std::uint32_t GetLastObservedTrackSampleRate() noexcept {
+    return g_lastObservedTrackSampleRate.load(std::memory_order_relaxed);
 }
 
 std::int32_t CreateStrictLosslessFilter(SubtypeFactory factory, void* allocator,
