@@ -19,6 +19,8 @@
 
 namespace {
 
+using namespace ammod::ipc;
+
 constexpr std::uint32_t kDefaultHardwareBufferMs = 20;
 constexpr std::uint32_t kMinimumHardwareBufferMs = 1;
 constexpr std::uint32_t kMaximumHardwareBufferMs = 100;
@@ -71,8 +73,6 @@ bool WriteTargetDevice(const std::wstring& id, const std::wstring& name) {
     (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
     return true;
 }
-
-using namespace ammod::ipc;
 
 struct Client {
     HANDLE pipe{};

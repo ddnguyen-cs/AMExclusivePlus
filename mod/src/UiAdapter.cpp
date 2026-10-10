@@ -104,6 +104,8 @@ void AttachTransportObservers();
 void AttachOrRefreshToggle();
 void ScheduleTransportObserverAttach();
 void ApplyNowPlayingStatus();
+void ApplyDeviceStatus(const Controls::ComboBox& box);
+void ScheduleStatusRefresh();
 void EnsureDispatcherTimer(const Microsoft::UI::Dispatching::DispatcherQueue& currentDispatcher);
 LRESULT CALLBACK UiThreadHook(int code, WPARAM wParam, LPARAM lParam);
 
