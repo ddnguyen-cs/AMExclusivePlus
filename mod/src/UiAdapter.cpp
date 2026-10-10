@@ -832,25 +832,32 @@ void PopulateDeviceComboBox(const Controls::ComboBox& box) {
 
 void ApplyDeviceStatus(const Controls::ComboBox& box) {
     if (!box) return;
-    const auto status = StatusSnapshot();
-    const std::wstring targetId = status.endpointId;
+    try {
+        if (box.Items().Size() == 0) {
+            PopulateDeviceComboBox(box);
+        }
+        const auto status = StatusSnapshot();
+        const std::wstring targetId = status.endpointId;
 
-    uint32_t targetIndex = 0;
-    const auto size = box.Items().Size();
-    for (uint32_t i = 0; i < size; ++i) {
-        if (auto item = box.Items().GetAt(i).try_as<Controls::ComboBoxItem>()) {
-            if (auto tag = item.Tag().try_as<winrt::Windows::Foundation::IPropertyValue>()) {
-                if (tag.GetString() == targetId) {
-                    targetIndex = i;
-                    break;
+        uint32_t targetIndex = 0;
+        const auto size = box.Items().Size();
+        for (uint32_t i = 0; i < size; ++i) {
+            if (auto item = box.Items().GetAt(i).try_as<Controls::ComboBoxItem>()) {
+                if (auto tag = item.Tag().try_as<winrt::Windows::Foundation::IPropertyValue>()) {
+                    if (tag.GetString() == targetId) {
+                        targetIndex = i;
+                        break;
+                    }
                 }
             }
         }
-    }
-    if (box.SelectedIndex() != static_cast<int32_t>(targetIndex)) {
-        g_deviceSelectionUpdating.store(true);
-        box.SelectedIndex(static_cast<int32_t>(targetIndex));
-        g_deviceSelectionUpdating.store(false);
+        if (size > 0 && box.SelectedIndex() != static_cast<int32_t>(targetIndex)) {
+            g_deviceSelectionUpdating.store(true);
+            box.SelectedIndex(static_cast<int32_t>(targetIndex));
+            g_deviceSelectionUpdating.store(false);
+        }
+    } catch (...) {
+        Log(L"ApplyDeviceStatus caught exception");
     }
 }
 
@@ -914,15 +921,21 @@ void ApplyNowPlayingStatus() {
            std::to_wstring(status.hardwareBufferMs ? status.hardwareBufferMs : 20u) + L" ms\n";
     tip += Localized(L"(右键点击切换输出设备 / DAC)", L"(Right-click to switch Output Device / DAC)");
 
-    for (auto it = g_transportNowPlayingObservers.begin(); it != g_transportNowPlayingObservers.end(); ) {
-        if (auto live = it->get()) {
-            if (auto element = live.try_as<Xaml::FrameworkElement>()) {
-                Controls::ToolTipService::SetToolTip(element, box_value(hstring(tip)));
-                element.ContextFlyout(CreateDeviceFlyout());
+    static std::wstring s_lastTip;
+    if (tip != s_lastTip) {
+        s_lastTip = tip;
+        for (auto it = g_transportNowPlayingObservers.begin(); it != g_transportNowPlayingObservers.end(); ) {
+            if (auto live = it->get()) {
+                if (auto element = live.try_as<Xaml::FrameworkElement>()) {
+                    try {
+                        Controls::ToolTipService::SetToolTip(element, box_value(hstring(tip)));
+                        element.ContextFlyout(CreateDeviceFlyout());
+                    } catch (...) {}
+                }
+                ++it;
+            } else {
+                it = g_transportNowPlayingObservers.erase(it);
             }
-            ++it;
-        } else {
-            it = g_transportNowPlayingObservers.erase(it);
         }
     }
 
@@ -1515,7 +1528,12 @@ void AttachOrRefreshToggle() {
                 }
             });
         }
-        target.Children().Append(card);
+        try {
+            target.Children().Append(card);
+            Log(L"Exclusive mode settings card attached to PlaybackSettingsPage");
+        } catch (const hresult_error& e) {
+            Log(L"Appending exclusive mode card failed: " + std::wstring(e.message().c_str()));
+        }
 
         Controls::TextBlock deviceTitle;
         deviceTitle.Text(Localized(L"输出设备", L"Output Device"));
@@ -1524,8 +1542,10 @@ void AttachOrRefreshToggle() {
             L"选择用于 WASAPI 独占输出的音频设备 / DAC。",
             L"Select the audio device / DAC for WASAPI exclusive output."));
         deviceDescription.TextWrapping(Xaml::TextWrapping::Wrap);
-        if (!nativeText.empty()) deviceTitle.Style(nativeText[0].Style());
-        if (nativeText.size() > 1) deviceDescription.Style(nativeText[1].Style());
+        try {
+            if (!nativeText.empty() && nativeText[0].Style()) deviceTitle.Style(nativeText[0].Style());
+            if (nativeText.size() > 1 && nativeText[1].Style()) deviceDescription.Style(nativeText[1].Style());
+        } catch (...) {}
 
         Controls::StackPanel deviceLabels;
         deviceLabels.VerticalAlignment(Xaml::VerticalAlignment::Center);
@@ -1537,8 +1557,11 @@ void AttachOrRefreshToggle() {
         deviceBox.MinWidth(220.0);
         deviceBox.VerticalAlignment(Xaml::VerticalAlignment::Center);
         g_deviceSelectionUpdating.store(true);
-        PopulateDeviceComboBox(deviceBox);
-        ApplyDeviceStatus(deviceBox);
+        try {
+            PopulateDeviceComboBox(deviceBox);
+        } catch (...) {
+            Log(L"PopulateDeviceComboBox failed during attach");
+        }
         g_deviceSelectionUpdating.store(false);
         deviceBox.SelectionChanged([](auto&& sender, auto&&) {
             if (g_deviceSelectionUpdating.load()) return;
@@ -1593,7 +1616,12 @@ void AttachOrRefreshToggle() {
         deviceCard.VerticalAlignment(card.VerticalAlignment());
         deviceCard.MinHeight(card.MinHeight());
         deviceCard.MaxWidth(card.MaxWidth());
-        target.Children().Append(deviceCard);
+        try {
+            target.Children().Append(deviceCard);
+            Log(L"Output device settings card attached to PlaybackSettingsPage");
+        } catch (const hresult_error& e) {
+            Log(L"Appending deviceCard failed: " + std::wstring(e.message().c_str()));
+        }
 
         Controls::TextBlock bufferTitle;
         bufferTitle.Text(Localized(L"硬件缓冲区", L"Hardware buffer"));
@@ -1602,8 +1630,10 @@ void AttachOrRefreshToggle() {
             L"设置 WASAPI 独占输出的硬件缓冲时长（毫秒）。",
             L"Set the WASAPI exclusive hardware buffer duration in milliseconds."));
         bufferDescription.TextWrapping(Xaml::TextWrapping::Wrap);
-        if (!nativeText.empty()) bufferTitle.Style(nativeText[0].Style());
-        if (nativeText.size() > 1) bufferDescription.Style(nativeText[1].Style());
+        try {
+            if (!nativeText.empty() && nativeText[0].Style()) bufferTitle.Style(nativeText[0].Style());
+            if (nativeText.size() > 1 && nativeText[1].Style()) bufferDescription.Style(nativeText[1].Style());
+        } catch (...) {}
 
         Controls::StackPanel bufferLabels;
         bufferLabels.VerticalAlignment(Xaml::VerticalAlignment::Center);
@@ -1627,7 +1657,7 @@ void AttachOrRefreshToggle() {
             bufferInput, Localized(L"请输入 1 到 100 之间的整数",
                                    L"Enter an integer from 1 through 100"));
         Controls::Button bufferApply;
-        bufferApply.Content(box_value(Localized(L"确定", L"Apply")));
+        bufferApply.Content(box_value(hstring(Localized(L"确定", L"Apply"))));
         bufferApply.MinWidth(72.0);
         bufferApply.VerticalAlignment(Xaml::VerticalAlignment::Center);
         Automation::AutomationProperties::SetName(
@@ -1675,21 +1705,27 @@ void AttachOrRefreshToggle() {
         bufferCard.VerticalAlignment(card.VerticalAlignment());
         bufferCard.MinHeight(card.MinHeight());
         bufferCard.MaxWidth(card.MaxWidth());
-        target.Children().Append(bufferCard);
+        try {
+            target.Children().Append(bufferCard);
+            Log(L"Hardware buffer settings card attached to PlaybackSettingsPage");
+        } catch (const hresult_error& e) {
+            Log(L"Appending bufferCard failed: " + std::wstring(e.message().c_str()));
+        }
 
-        RememberToggle(toggle);
-        RememberDeviceComboBox(deviceBox);
-        RememberHardwareBufferBox(bufferInput);
-        ApplyStatus(toggle);
-        ApplyDeviceStatus(deviceBox);
-        ApplyHardwareBufferStatus(bufferInput);
-        Log(L"Exclusive mode settings card attached to PlaybackSettingsPage");
-        Log(L"Output device settings card attached to PlaybackSettingsPage");
-        Log(L"Hardware buffer settings card attached to PlaybackSettingsPage");
+        try { RememberToggle(toggle); } catch (...) {}
+        try { RememberDeviceComboBox(deviceBox); } catch (...) {}
+        try { RememberHardwareBufferBox(bufferInput); } catch (...) {}
+        try { ApplyStatus(toggle); } catch (...) {}
+        try { ApplyDeviceStatus(deviceBox); } catch (...) {}
+        try { ApplyHardwareBufferStatus(bufferInput); } catch (...) {}
     } catch (const hresult_error& error) {
         std::wostringstream text;
         text << L"UI attach failed hr=0x" << std::hex << error.code().value << L" " << error.message().c_str();
         Log(text.str());
+    } catch (const std::exception& error) {
+        std::string what = error.what();
+        std::wstring wWhat(what.begin(), what.end());
+        Log(L"UI attach failed std::exception: " + wWhat);
     } catch (...) {
         Log(L"UI attach failed with unknown exception");
     }

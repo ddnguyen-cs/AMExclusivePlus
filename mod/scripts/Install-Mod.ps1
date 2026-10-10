@@ -137,14 +137,13 @@ foreach ($existingIni in @(
                 $preservedPeriod100ns = $candidatePeriod
             }
         }
-        if ($line -match '^\s*device_id\s*=\s*(.+?)\s*$') {
+        if ($line -match '^\s*device_id\s*=\s*(.*?)\s*$') {
             $preservedDeviceId = $Matches[1]
         }
-        if ($line -match '^\s*device_name\s*=\s*(.+?)\s*$') {
+        if ($line -match '^\s*device_name\s*=\s*(.*?)\s*$') {
             $preservedDeviceName = $Matches[1]
         }
     }
-    if ($preservedMode -and $preservedPeriod100ns) { break }
 }
 
 if (Test-Path -LiteralPath $install -PathType Container) {
@@ -167,35 +166,26 @@ foreach ($name in $payloadFiles) {
     $destination = Join-Path $install $name
     Copy-Item -LiteralPath (Join-Path $source $name) -Destination $destination -Force
 }
-if ($preservedMode) {
-    $iniPath = Join-Path $install 'am-exclusive.ini'
+
+$iniPath = Join-Path $install 'am-exclusive.ini'
+if (Test-Path -LiteralPath $iniPath -PathType Leaf) {
     $iniText = [IO.File]::ReadAllText($iniPath)
-    $iniText = [Text.RegularExpressions.Regex]::Replace(
-        $iniText, '(?m)^\s*mode\s*=.*$', "mode=$preservedMode")
-    $utf8NoBom = New-Object Text.UTF8Encoding($false)
-    [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
-}
-if ($preservedPeriod100ns) {
-    $iniPath = Join-Path $install 'am-exclusive.ini'
-    $iniText = [IO.File]::ReadAllText($iniPath)
-    $iniText = [Text.RegularExpressions.Regex]::Replace(
-        $iniText, '(?m)^\s*period_100ns\s*=.*$', "period_100ns=$preservedPeriod100ns")
-    $utf8NoBom = New-Object Text.UTF8Encoding($false)
-    [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
-}
-if ($preservedDeviceId) {
-    $iniPath = Join-Path $install 'am-exclusive.ini'
-    $iniText = [IO.File]::ReadAllText($iniPath)
-    $iniText = [Text.RegularExpressions.Regex]::Replace(
-        $iniText, '(?m)^\s*device_id\s*=.*$', "device_id=$preservedDeviceId")
-    $utf8NoBom = New-Object Text.UTF8Encoding($false)
-    [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
-}
-if ($preservedDeviceName) {
-    $iniPath = Join-Path $install 'am-exclusive.ini'
-    $iniText = [IO.File]::ReadAllText($iniPath)
-    $iniText = [Text.RegularExpressions.Regex]::Replace(
-        $iniText, '(?m)^\s*device_name\s*=.*$', "device_name=$preservedDeviceName")
+    if ($null -ne $preservedMode) {
+        $iniText = [Text.RegularExpressions.Regex]::Replace(
+            $iniText, '(?m)^\s*mode\s*=.*$', "mode=$preservedMode")
+    }
+    if ($null -ne $preservedPeriod100ns) {
+        $iniText = [Text.RegularExpressions.Regex]::Replace(
+            $iniText, '(?m)^\s*period_100ns\s*=.*$', "period_100ns=$preservedPeriod100ns")
+    }
+    if ($null -ne $preservedDeviceId) {
+        $iniText = [Text.RegularExpressions.Regex]::Replace(
+            $iniText, '(?m)^\s*device_id\s*=.*$', "device_id=$preservedDeviceId")
+    }
+    if ($null -ne $preservedDeviceName) {
+        $iniText = [Text.RegularExpressions.Regex]::Replace(
+            $iniText, '(?m)^\s*device_name\s*=.*$', "device_name=$preservedDeviceName")
+    }
     $utf8NoBom = New-Object Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
 }

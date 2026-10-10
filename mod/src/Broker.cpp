@@ -773,6 +773,7 @@ void HandleMessage(const Message& incoming, HANDLE source) {
         if (incoming.type == MessageType::SetEnabled) {
             WritePrivateProfileStringW(L"mod", L"mode",
                 g_status.enabledIntent ? L"exclusive" : L"probe", BrokerIniPath().c_str());
+            (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, BrokerIniPath().c_str());
         }
         g_status.senderPid = GetCurrentProcessId();
         GetSystemTimeAsFileTime(&g_status.timestampUtc);

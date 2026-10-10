@@ -1748,68 +1748,63 @@ bool ExclusiveRequested() {
 void AudioCoreRuntimeEventCallback(void* context,
                                    ammod::audio_v2::AudioCoreRuntimeEvent event,
                                    HRESULT result) noexcept {
-    auto* runtime = static_cast<ammod::audio_v2::AudioCoreRuntime*>(context);
-    if (!runtime) return;
-    switch (event) {
-    case ammod::audio_v2::AudioCoreRuntimeEvent::Bound: {
-        const auto& format = runtime->Coordinator().Format();
-        const auto sourceBits = format.sourceValidBits == 0
-            ? format.validBits : format.sourceValidBits;
-        Log(L"audio core v2 bound active AudioUnit/P0 converter outputFormat{rate=" +
-            std::to_wstring(format.sampleRate) + L" channels=" +
-            std::to_wstring(format.channels) + L" validBits=" +
-            std::to_wstring(format.validBits) + L" containerBits=" +
-            std::to_wstring(format.containerBits) + L" sourceBits=" +
-            std::to_wstring(sourceBits) + L" encoding=signed-int interleaved=1}");
-        Log(L"audio core v2 bound qpc=" + std::to_wstring(CurrentQpc()));
-        if (void* pendingLocal = g_v2PendingLocalConverter.load(std::memory_order_acquire);
-            pendingLocal && runtime->BoundConverter() == pendingLocal) {
-            (void)PromoteV2LocalQueue(pendingLocal);
+    try {
+        auto* runtime = static_cast<ammod::audio_v2::AudioCoreRuntime*>(context);
+        if (!runtime) return;
+        switch (event) {
+        case ammod::audio_v2::AudioCoreRuntimeEvent::Bound: {
+            const auto& format = runtime->Coordinator().Format();
+            const auto sourceBits = format.sourceValidBits == 0
+                ? format.validBits : format.sourceValidBits;
+            Log(L"audio core v2 bound active AudioUnit/P0 converter outputFormat{rate=" +
+                std::to_wstring(format.sampleRate) + L" channels=" +
+                std::to_wstring(format.channels) + L" validBits=" +
+                std::to_wstring(format.validBits) + L" containerBits=" +
+                std::to_wstring(format.containerBits) + L" sourceBits=" +
+                std::to_wstring(sourceBits) + L" encoding=signed-int interleaved=1}");
+            Log(L"audio core v2 bound qpc=" + std::to_wstring(CurrentQpc()));
+            if (void* pendingLocal = g_v2PendingLocalConverter.load(std::memory_order_acquire);
+                pendingLocal && runtime->BoundConverter() == pendingLocal) {
+                (void)PromoteV2LocalQueue(pendingLocal);
+            }
+            const auto boundEndpointId = runtime->CurrentEndpointId();
+            const auto boundEndpointName = runtime->CurrentEndpointName();
+            SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
+                           ammod::ipc::RuntimeState::Probing, true,
+                           boundEndpointId, boundEndpointName, {});
+            break;
         }
-        const auto boundEndpointId = runtime->CurrentEndpointId();
-        auto boundEndpointName = runtime->CurrentEndpointName();
-        if (boundEndpointName.empty() && !boundEndpointId.empty()) {
-            boundEndpointName = ammod::audio::GetDeviceNameFromId(boundEndpointId);
-        }
-        SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
-                       ammod::ipc::RuntimeState::Probing, true,
-                       boundEndpointId, boundEndpointName, {});
-        break;
-    }
-    case ammod::audio_v2::AudioCoreRuntimeEvent::Active: {
-        const auto& format = runtime->Coordinator().Format();
-        const auto sourceBits = format.sourceValidBits == 0
-            ? format.validBits : format.sourceValidBits;
-        if (!kNativeAcquisitionPassthrough) {
-            g_nativeP0CutoverResumeRequested.store(true, std::memory_order_release);
-            Log(L"audio core v2 Mod-owned P0 puller Active resume queued");
-        } else {
-            Log(L"audio core v2 native acquisition passthrough Active; original Fill/scheduler remains producer");
-        }
-        Log(L"audio core v2 exclusive sink active; native output gate committed outputFormat{rate=" +
-            std::to_wstring(format.sampleRate) + L" channels=" +
-            std::to_wstring(format.channels) + L" validBits=" +
-            std::to_wstring(format.validBits) + L" containerBits=" +
-            std::to_wstring(format.containerBits) + L" sourceBits=" +
-            std::to_wstring(sourceBits) + L" encoding=signed-int interleaved=1}");
-        Log(L"audio core v2 active qpc=" + std::to_wstring(CurrentQpc()));
+        case ammod::audio_v2::AudioCoreRuntimeEvent::Active: {
+            const auto& format = runtime->Coordinator().Format();
+            const auto sourceBits = format.sourceValidBits == 0
+                ? format.validBits : format.sourceValidBits;
+            if (!kNativeAcquisitionPassthrough) {
+                g_nativeP0CutoverResumeRequested.store(true, std::memory_order_release);
+                Log(L"audio core v2 Mod-owned P0 puller Active resume queued");
+            } else {
+                Log(L"audio core v2 native acquisition passthrough Active; original Fill/scheduler remains producer");
+            }
+            Log(L"audio core v2 exclusive sink active; native output gate committed outputFormat{rate=" +
+                std::to_wstring(format.sampleRate) + L" channels=" +
+                std::to_wstring(format.channels) + L" validBits=" +
+                std::to_wstring(format.validBits) + L" containerBits=" +
+                std::to_wstring(format.containerBits) + L" sourceBits=" +
+                std::to_wstring(sourceBits) + L" encoding=signed-int interleaved=1}");
+            Log(L"audio core v2 active qpc=" + std::to_wstring(CurrentQpc()));
 
-        const auto activeEndpointId = runtime->CurrentEndpointId();
-        auto activeEndpointName = runtime->CurrentEndpointName();
-        if (activeEndpointName.empty() && !activeEndpointId.empty()) {
-            activeEndpointName = ammod::audio::GetDeviceNameFromId(activeEndpointId);
+            const auto activeEndpointId = runtime->CurrentEndpointId();
+            const auto activeEndpointName = runtime->CurrentEndpointName();
+            std::wostringstream formatStream;
+            formatStream << sourceBits << L"-bit / "
+                         << std::fixed << std::setprecision(1) << (format.sampleRate / 1000.0) << L" kHz";
+            if (runtime->Coordinator().Sink().Stats().lastError == S_OK) {
+                formatStream << L" (Bit-Perfect)";
+            }
+            SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
+                           ammod::ipc::RuntimeState::Active, true,
+                           activeEndpointId, activeEndpointName, formatStream.str());
+            break;
         }
-        std::wostringstream formatStream;
-        formatStream << sourceBits << L"-bit / "
-                     << std::fixed << std::setprecision(1) << (format.sampleRate / 1000.0) << L" kHz";
-        if (runtime->Coordinator().Sink().Stats().lastError == S_OK) {
-            formatStream << L" (Bit-Perfect)";
-        }
-        SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
-                       ammod::ipc::RuntimeState::Active, true,
-                       activeEndpointId, activeEndpointName, formatStream.str());
-        break;
-    }
     case ammod::audio_v2::AudioCoreRuntimeEvent::Faulted: {
         const bool playbackRejected = ammod::audio::IsPlaybackRejection(result);
         if (!playbackRejected) {
@@ -1924,6 +1919,13 @@ void AudioCoreRuntimeEventCallback(void* context,
             std::to_wstring(g_v2P1LastQpc.load(std::memory_order_acquire)));
         break;
     }
+    }
+    } catch (const std::exception& e) {
+        std::string what = e.what();
+        std::wstring wWhat(what.begin(), what.end());
+        Log(L"AudioCoreRuntimeEventCallback exception: " + wWhat);
+    } catch (...) {
+        Log(L"AudioCoreRuntimeEventCallback unknown exception");
     }
 }
 
