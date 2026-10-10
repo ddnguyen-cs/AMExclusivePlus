@@ -87,11 +87,16 @@ std::atomic<std::uint64_t> g_lastErrorDialogSignature{};
 std::vector<Client> g_clients;
 Message g_status = [] {
     auto message = NewMessage(MessageType::StatusChanged, Role::Broker);
-    message.state = RuntimeState::Off;
+    wchar_t savedMode[32]{};
+    GetPrivateProfileStringW(L"mod", L"mode", L"shared", savedMode,
+        static_cast<DWORD>(std::size(savedMode)), BrokerIniPath().c_str());
+    message.enabledIntent = _wcsicmp(savedMode, L"exclusive") == 0 ? 1 : 0;
+    message.hardwareBufferMs = ReadHardwareBufferMs();
     const auto id = ReadTargetDeviceId();
     const auto name = ReadTargetDeviceName();
     if (!id.empty()) wcsncpy_s(message.endpointId, id.c_str(), _TRUNCATE);
     if (!name.empty()) wcsncpy_s(message.endpointName, name.c_str(), _TRUNCATE);
+    message.state = message.enabledIntent ? RuntimeState::WaitingForStream : RuntimeState::Off;
     return message;
 }();
 
@@ -723,15 +728,15 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             // phase; they do not represent a user toggle. Preserve the
             // broker-owned intent so an Agent event cannot erase the user's
             // persisted exclusive request.
+            g_status.enabledIntent = persistedIntent;
+            g_status.hardwareBufferMs = persistedHardwareBufferMs;
+            if (g_status.endpointId[0] == L'\0' && !persistedEndpointId.empty()) {
+                wcsncpy_s(g_status.endpointId, persistedEndpointId.c_str(), _TRUNCATE);
+            }
+            if (g_status.endpointName[0] == L'\0' && !persistedEndpointName.empty()) {
+                wcsncpy_s(g_status.endpointName, persistedEndpointName.c_str(), _TRUNCATE);
+            }
             if (incoming.role == Role::Agent) {
-                g_status.enabledIntent = persistedIntent;
-                g_status.hardwareBufferMs = persistedHardwareBufferMs;
-                if (g_status.endpointId[0] == L'\0' && !persistedEndpointId.empty()) {
-                    wcsncpy_s(g_status.endpointId, persistedEndpointId.c_str(), _TRUNCATE);
-                }
-                if (g_status.endpointName[0] == L'\0' && !persistedEndpointName.empty()) {
-                    wcsncpy_s(g_status.endpointName, persistedEndpointName.c_str(), _TRUNCATE);
-                }
                 if (persistedIntent && incoming.state == RuntimeState::Off) {
                     g_status.state = RuntimeState::WaitingForStream;
                 }
@@ -867,10 +872,16 @@ int wmain() {
         static_cast<DWORD>(std::size(savedMode)), BrokerIniPath().c_str());
     g_status.enabledIntent = _wcsicmp(savedMode, L"exclusive") == 0 ? 1 : 0;
     g_status.hardwareBufferMs = ReadHardwareBufferMs();
+    const auto savedDeviceId = ReadTargetDeviceId();
+    const auto savedDeviceName = ReadTargetDeviceName();
+    wcsncpy_s(g_status.endpointId, savedDeviceId.c_str(), _TRUNCATE);
+    wcsncpy_s(g_status.endpointName, savedDeviceName.c_str(), _TRUNCATE);
     g_status.state = g_status.enabledIntent ? RuntimeState::WaitingForStream : RuntimeState::Off;
     Log(L"companion started pid=" + std::to_wstring(GetCurrentProcessId()) +
         L" persistedIntent=" + std::to_wstring(g_status.enabledIntent) +
-        L" hardwareBufferMs=" + std::to_wstring(g_status.hardwareBufferMs));
+        L" hardwareBufferMs=" + std::to_wstring(g_status.hardwareBufferMs) +
+        L" endpointId=" + savedDeviceId +
+        L" endpointName=" + savedDeviceName);
     const auto pipeName = PipeName();
     PipeSecurity security;
     if (pipeName.empty() || !security.IsValid()) {
