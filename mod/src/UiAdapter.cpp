@@ -983,7 +983,7 @@ void AttachTransportPopupLifecycle(const Primitives::Popup& popup) {
     });
 }
 
-void AttachNowPlayingDacSelector(const Xaml::DependencyObject& content, const Xaml::Window& window) {
+void AttachNowPlayingDacSelector(const Xaml::DependencyObject& content, const Xaml::Window& /*window*/) {
     if (!content) return;
     if (FindByName(content, L"AMExclusiveNowPlayingDacCombo")) {
         if (auto existing = FindByName(content, L"AMExclusiveNowPlayingDacCombo").try_as<Controls::ComboBox>()) {

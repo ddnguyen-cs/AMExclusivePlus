@@ -70,6 +70,8 @@ bool WriteSelectedEndpointId(const std::wstring& id) {
     return true;
 }
 
+bool UseChineseUi() noexcept;
+
 // Enumerate active WASAPI render endpoints.
 // Returns a newline-delimited list of "id\tFriendlyName" entries.
 // The first entry is always the system-default device (id = empty string).
