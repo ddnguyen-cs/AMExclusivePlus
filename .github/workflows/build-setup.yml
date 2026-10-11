@@ -2,6 +2,10 @@ name: Build Setup
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+      - ameplus
 
 permissions:
   contents: read

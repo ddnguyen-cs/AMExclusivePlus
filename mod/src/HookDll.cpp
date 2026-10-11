@@ -3464,6 +3464,7 @@ DWORD WINAPI PipeClientLoop(void*) {
                 const auto hardwareBufferMs = incoming.hardwareBufferMs
                     ? incoming.hardwareBufferMs : 20u;
                 g_audioCoreRuntime.SetHardwareBufferMilliseconds(hardwareBufferMs);
+                g_audioCoreRuntime.SetEndpointId(incoming.selectedEndpointId);
                 g_ipcEnabled.store(enabled, std::memory_order_release);
                 if (!enabled) g_nativeP0Puller.DisableForUiOff();
                 g_audioCoreGate.SetUiEnabled(enabled);
@@ -3471,7 +3472,11 @@ DWORD WINAPI PipeClientLoop(void*) {
                 Log(L"broker status received enabled=" +
                     std::to_wstring(incoming.enabledIntent) + L" state=" +
                     std::to_wstring(static_cast<unsigned>(incoming.state)) +
-                    L" hardwareBufferMs=" + std::to_wstring(hardwareBufferMs));
+                    L" hardwareBufferMs=" + std::to_wstring(hardwareBufferMs) +
+                    L" selectedEndpoint=" + incoming.selectedEndpointId);
+            } else if (incoming.type == MessageType::SetEndpoint) {
+                g_audioCoreRuntime.SetEndpointId(incoming.selectedEndpointId);
+                Log(L"broker set_endpoint received id=" + std::wstring(incoming.selectedEndpointId));
             } else if (incoming.type == MessageType::TransportIntent) {
                 if (wcscmp(incoming.detail, L"play_pause") == 0) {
                     g_audioCoreRuntime.OnTransportPlayPause();

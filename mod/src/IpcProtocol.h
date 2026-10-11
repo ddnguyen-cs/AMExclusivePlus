@@ -12,11 +12,13 @@ namespace ammod::ipc {
 
 inline constexpr std::uint32_t kMagic = 0x50494D41; // "AMIP" little-endian
 inline constexpr std::uint16_t kProtocolMajor = 2;
-inline constexpr std::uint16_t kProtocolMinor = 0;
+inline constexpr std::uint16_t kProtocolMinor = 1; // added selectedEndpointId + expanded detail
 inline constexpr std::size_t kEndpointIdChars = 256;
 inline constexpr std::size_t kEndpointNameChars = 128;
 inline constexpr std::size_t kFormatChars = 160;
 inline constexpr std::size_t kDetailChars = 256;
+// Newline-delimited "id\tname" pairs for EndpointList messages.
+inline constexpr std::size_t kEndpointListChars = 1024;
 
 enum class Role : std::uint16_t {
     Unknown = 0,
@@ -42,6 +44,12 @@ enum class MessageType : std::uint16_t {
     // `generation` carries the seek gesture epoch.
     TransportIntent = 9,
     SetHardwareBuffer = 10,
+    // UI → Broker → Agent: change the preferred exclusive output device.
+    // selectedEndpointId carries the WASAPI device GUID (empty = system default).
+    SetEndpoint = 11,
+    // Broker → UI: reply to an implicit refresh, carries a newline-delimited
+    // list of "id\tname" pairs in the detail field (first entry is current default).
+    EndpointList = 12,
 };
 
 enum class RuntimeState : std::uint16_t {
@@ -106,7 +114,17 @@ struct Message {
     wchar_t endpointId[kEndpointIdChars]{};
     wchar_t endpointName[kEndpointNameChars]{};
     wchar_t format[kFormatChars]{};
-    wchar_t detail[kDetailChars]{};
+    // selectedEndpointId: WASAPI device GUID chosen by the user via the DAC
+    // selector. Empty string means "use the system default output device".
+    // Carried in SetEndpoint messages (UI → Broker → Agent) and echoed back
+    // in StatusChanged so the UI can reflect the persisted selection.
+    wchar_t selectedEndpointId[kEndpointIdChars]{};
+    // detail / endpoint list: multipurpose wchar field.
+    // • Most messages: short human-readable status detail.
+    // • EndpointList: newline-separated "deviceId\tDeviceName" pairs.
+    //   The first line is always the current system-default device
+    //   (id = empty string, name = localised default label).
+    wchar_t detail[kEndpointListChars]{};
 };
 #pragma pack(pop)
 

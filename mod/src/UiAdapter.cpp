@@ -52,6 +52,7 @@ std::mutex g_pipeWriteMutex;
 std::mutex g_statusMutex;
 std::mutex g_uiTargetMutex;
 std::mutex g_transportMutex;
+std::mutex g_endpointMutex;
 HANDLE g_pipe{INVALID_HANDLE_VALUE};
 Message g_status{};
 std::atomic<bool> g_connected{};
@@ -87,12 +88,26 @@ HWINEVENTHOOK g_windowLifecycleHook{};
 HWND g_mainWindow{};
 winrt::weak_ref<Controls::ToggleSwitch> g_toggle;
 winrt::weak_ref<Controls::TextBox> g_hardwareBufferBox;
+winrt::weak_ref<Controls::ComboBox> g_dacComboSettings;
+winrt::weak_ref<Controls::ComboBox> g_dacComboNowPlaying;
+
+struct EndpointItem {
+    std::wstring id;
+    std::wstring name;
+};
+std::mutex g_endpointsMutex;
+std::vector<EndpointItem> g_endpoints;
+std::atomic<bool> g_hasPendingEndpoint{false};
+std::wstring g_pendingEndpointId;
+std::atomic<bool> g_suppressEndpointCombo{false};
+
 Microsoft::UI::Dispatching::DispatcherQueue g_dispatcher{nullptr};
 Microsoft::UI::Dispatching::DispatcherQueueTimer g_statusRefreshTimer{nullptr};
 
 void AttachTransportObservers();
 void AttachOrRefreshToggle();
 void ScheduleTransportObserverAttach();
+void ScheduleStatusRefresh();
 LRESULT CALLBACK UiThreadHook(int code, WPARAM wParam, LPARAM lParam);
 
 bool ArmUiThreadRefresh(HWND window) {
@@ -255,6 +270,123 @@ bool TrySendConnectedMessage(const Message& message) {
     if (g_pipe == INVALID_HANDLE_VALUE) return false;
     std::lock_guard writeLock(g_pipeWriteMutex);
     return WriteMessage(g_pipe, message);
+}
+
+bool SendEndpoint(const std::wstring& endpointId) {
+    auto message = NewMessage(MessageType::SetEndpoint, Role::Ui);
+    message.uiPid = GetCurrentProcessId();
+    wcsncpy_s(message.selectedEndpointId, endpointId.c_str(), _TRUNCATE);
+    if (TrySendConnectedMessage(message)) {
+        Log(L"endpoint sent immediate id=" + endpointId);
+        return true;
+    }
+    std::lock_guard lock(g_endpointMutex);
+    g_pendingEndpointId = endpointId;
+    g_hasPendingEndpoint.store(true);
+    return true;
+}
+
+void ParseAndApplyEndpointList(const wchar_t* raw) {
+    if (!raw) return;
+    std::vector<EndpointItem> list;
+    std::wistringstream stream(raw);
+    std::wstring line;
+    while (std::getline(stream, line)) {
+        if (line.empty()) continue;
+        const auto tab = line.find(L'\t');
+        if (tab != std::wstring::npos) {
+            EndpointItem item;
+            item.id = line.substr(0, tab);
+            item.name = line.substr(tab + 1);
+            if (!item.name.empty()) {
+                list.push_back(std::move(item));
+            }
+        }
+    }
+    {
+        std::lock_guard lock(g_endpointsMutex);
+        g_endpoints = std::move(list);
+    }
+    Log(L"parsed endpoint list count=" + std::to_wstring(g_endpoints.size()));
+    ScheduleStatusRefresh();
+}
+
+void ApplyEndpointsToCombo(const Controls::ComboBox& combo) {
+    if (!combo) return;
+    std::vector<EndpointItem> endpoints;
+    std::wstring selectedId;
+    {
+        std::lock_guard lock(g_endpointsMutex);
+        endpoints = g_endpoints;
+    }
+    {
+        std::lock_guard lock(g_statusMutex);
+        selectedId = g_status.selectedEndpointId;
+    }
+    g_suppressEndpointCombo.store(true);
+
+    const auto currentCount = combo.Items().Size();
+    bool needsRepopulate = (currentCount != endpoints.size());
+    if (!needsRepopulate) {
+        for (std::size_t i = 0; i < endpoints.size(); ++i) {
+            auto item = combo.Items().GetAt(static_cast<uint32_t>(i));
+            if (unbox_value_or<hstring>(item, L"") != hstring(endpoints[i].name)) {
+                needsRepopulate = true;
+                break;
+            }
+        }
+    }
+
+    if (needsRepopulate) {
+        combo.Items().Clear();
+        for (const auto& ep : endpoints) {
+            combo.Items().Append(box_value(hstring(ep.name)));
+        }
+    }
+
+    int targetIndex = 0;
+    for (std::size_t i = 0; i < endpoints.size(); ++i) {
+        if (!selectedId.empty() && endpoints[i].id == selectedId) {
+            targetIndex = static_cast<int>(i);
+            break;
+        }
+    }
+
+    if (combo.Items().Size() > 0 && combo.SelectedIndex() != targetIndex) {
+        combo.SelectedIndex(targetIndex);
+    }
+    g_suppressEndpointCombo.store(false);
+}
+
+void WireEndpointCombo(const Controls::ComboBox& combo) {
+    combo.SelectionChanged([](winrt::Windows::Foundation::IInspectable const& sender,
+                              Controls::SelectionChangedEventArgs const&) {
+        if (g_suppressEndpointCombo.load()) return;
+        auto control = sender.as<Controls::ComboBox>();
+        const int index = control.SelectedIndex();
+        if (index < 0) return;
+        std::wstring selectedId;
+        {
+            std::lock_guard lock(g_endpointsMutex);
+            if (index < static_cast<int>(g_endpoints.size())) {
+                selectedId = g_endpoints[index].id;
+            }
+        }
+        Log(L"user selected endpoint index=" + std::to_wstring(index) + L" id=" + selectedId);
+        SendEndpoint(selectedId);
+        ScheduleStatusRefresh();
+    });
+}
+
+void RememberEndpointCombo(const Controls::ComboBox& combo, bool isNowPlaying = false) {
+    std::lock_guard lock(g_uiTargetMutex);
+    if (isNowPlaying) {
+        g_dacComboNowPlaying = make_weak(combo);
+    } else {
+        g_dacComboSettings = make_weak(combo);
+    }
+    auto current = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+    if (!g_dispatcher) g_dispatcher = current ? current : combo.DispatcherQueue();
 }
 
 void QueueTransport(std::wstring_view action, std::uint64_t epoch = 0) {
@@ -762,13 +894,19 @@ void RememberToggle(const Controls::ToggleSwitch& toggle) {
         g_statusRefreshTimer.Tick([](auto&&, auto&&) {
             winrt::weak_ref<Controls::ToggleSwitch> target;
             winrt::weak_ref<Controls::TextBox> hardwareBuffer;
+            winrt::weak_ref<Controls::ComboBox> dacSettings;
+            winrt::weak_ref<Controls::ComboBox> dacNowPlaying;
             {
                 std::lock_guard targetLock(g_uiTargetMutex);
                 target = g_toggle;
                 hardwareBuffer = g_hardwareBufferBox;
+                dacSettings = g_dacComboSettings;
+                dacNowPlaying = g_dacComboNowPlaying;
             }
             if (auto control = target.get()) ApplyStatus(control);
             if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
+            if (auto combo = dacSettings.get()) ApplyEndpointsToCombo(combo);
+            if (auto combo = dacNowPlaying.get()) ApplyEndpointsToCombo(combo);
         });
         g_statusRefreshTimer.Start();
         Log(L"UI status refresh timer started intervalMs=250");
@@ -786,17 +924,23 @@ void RememberHardwareBufferBox(const Controls::TextBox& input) {
 void ScheduleStatusRefresh() {
     winrt::weak_ref<Controls::ToggleSwitch> toggle;
     winrt::weak_ref<Controls::TextBox> hardwareBuffer;
+    winrt::weak_ref<Controls::ComboBox> dacSettings;
+    winrt::weak_ref<Controls::ComboBox> dacNowPlaying;
     Microsoft::UI::Dispatching::DispatcherQueue dispatcher{nullptr};
     {
         std::lock_guard lock(g_uiTargetMutex);
         toggle = g_toggle;
         hardwareBuffer = g_hardwareBufferBox;
+        dacSettings = g_dacComboSettings;
+        dacNowPlaying = g_dacComboNowPlaying;
         dispatcher = g_dispatcher;
     }
     if (dispatcher) {
-        dispatcher.TryEnqueue([toggle, hardwareBuffer] {
+        dispatcher.TryEnqueue([toggle, hardwareBuffer, dacSettings, dacNowPlaying] {
             if (auto control = toggle.get()) ApplyStatus(control);
             if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
+            if (auto combo = dacSettings.get()) ApplyEndpointsToCombo(combo);
+            if (auto combo = dacNowPlaying.get()) ApplyEndpointsToCombo(combo);
         });
     }
 }
@@ -837,6 +981,92 @@ void AttachTransportPopupLifecycle(const Primitives::Popup& popup) {
         CommitSeekGesture(0, L"popup-closed");
         ScheduleTransportObserverAttach();
     });
+}
+
+void AttachNowPlayingDacSelector(const Xaml::DependencyObject& content, const Xaml::Window& window) {
+    if (!content) return;
+    if (FindByName(content, L"AMExclusiveNowPlayingDacCombo")) {
+        if (auto existing = FindByName(content, L"AMExclusiveNowPlayingDacCombo").try_as<Controls::ComboBox>()) {
+            RememberEndpointCombo(existing, true);
+            ApplyEndpointsToCombo(existing);
+        }
+        return;
+    }
+
+    std::vector<Xaml::DependencyObject> sliders;
+    CollectSliders(content, sliders);
+    Controls::Slider volumeSlider{nullptr};
+    for (const auto& s : sliders) {
+        if (auto slider = s.try_as<Controls::Slider>()) {
+            if (slider.Name() != L"LCDScrubber" &&
+                Automation::AutomationProperties::GetAutomationId(slider) != L"LCDScrubber") {
+                volumeSlider = slider;
+                break;
+            }
+        }
+    }
+
+    Controls::Panel anchorPanel{nullptr};
+    if (volumeSlider) {
+        auto parent = Media::VisualTreeHelper::GetParent(volumeSlider);
+        if (auto panel = parent.try_as<Controls::Panel>()) {
+            anchorPanel = panel;
+        } else if (parent) {
+            auto grandparent = Media::VisualTreeHelper::GetParent(parent);
+            if (auto gpPanel = grandparent.try_as<Controls::Panel>()) {
+                anchorPanel = gpPanel;
+            }
+        }
+    }
+
+    if (!anchorPanel) {
+        std::vector<Xaml::DependencyObject> playPauseNodes;
+        CollectByName(content, L"TransportControl_PlayPauseStop", playPauseNodes);
+        CollectByAutomationId(content, L"TransportControl_PlayPauseStop", playPauseNodes);
+        if (!playPauseNodes.empty()) {
+            auto parent = Media::VisualTreeHelper::GetParent(playPauseNodes.front());
+            if (auto panel = parent.try_as<Controls::Panel>()) {
+                anchorPanel = panel;
+            }
+        }
+    }
+
+    if (!anchorPanel) {
+        std::vector<Xaml::DependencyObject> scrubberNodes;
+        CollectByName(content, L"LCDScrubber", scrubberNodes);
+        CollectByAutomationId(content, L"LCDScrubber", scrubberNodes);
+        if (!scrubberNodes.empty()) {
+            auto parent = Media::VisualTreeHelper::GetParent(scrubberNodes.front());
+            if (auto panel = parent.try_as<Controls::Panel>()) {
+                anchorPanel = panel;
+            }
+        }
+    }
+
+    if (!anchorPanel) return;
+
+    Controls::ComboBox nowPlayingCombo;
+    nowPlayingCombo.Name(L"AMExclusiveNowPlayingDacCombo");
+    nowPlayingCombo.Width(130.0);
+    nowPlayingCombo.Height(28.0);
+    nowPlayingCombo.FontSize(11.0);
+    nowPlayingCombo.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    nowPlayingCombo.Margin(Xaml::Thickness{6, 0, 6, 0});
+    Automation::AutomationProperties::SetName(
+        nowPlayingCombo, Localized(L"输出设备", L"Output device"));
+    Automation::AutomationProperties::SetHelpText(
+        nowPlayingCombo, Localized(L"选择用于 WASAPI 独占输出的音频设备",
+                                   L"Select the audio device for WASAPI exclusive output"));
+
+    WireEndpointCombo(nowPlayingCombo);
+    if (auto stack = anchorPanel.try_as<Controls::StackPanel>()) {
+        stack.Children().Append(nowPlayingCombo);
+    } else {
+        anchorPanel.Children().Append(nowPlayingCombo);
+    }
+    RememberEndpointCombo(nowPlayingCombo, true);
+    ApplyEndpointsToCombo(nowPlayingCombo);
+    Log(L"Now playing DAC selector attached to transport panel");
 }
 
 void AttachTransportObservers() {
@@ -1024,6 +1254,7 @@ void AttachTransportObservers() {
                     });
                 }
             }
+            AttachNowPlayingDacSelector(content, window);
         }
     } catch (const hresult_error& error) {
         std::wostringstream text;
@@ -1053,6 +1284,11 @@ void AttachOrRefreshToggle() {
                                  .try_as<Controls::TextBox>()) {
                 RememberHardwareBufferBox(input);
                 ApplyHardwareBufferStatus(input);
+            }
+            if (auto combo = FindByName(page, L"AMExclusiveEndpointCombo")
+                                 .try_as<Controls::ComboBox>()) {
+                RememberEndpointCombo(combo);
+                ApplyEndpointsToCombo(combo);
             }
             return;
         }
@@ -1363,12 +1599,67 @@ void AttachOrRefreshToggle() {
         bufferCard.MaxWidth(card.MaxWidth());
         target.Children().Append(bufferCard);
 
+        Controls::TextBlock endpointTitle;
+        endpointTitle.Text(Localized(L"输出设备", L"Output device"));
+        Controls::TextBlock endpointDescription;
+        endpointDescription.Text(Localized(
+            L"选择用于 WASAPI 独占输出的音频设备。",
+            L"Select the audio device for WASAPI exclusive output."));
+        endpointDescription.TextWrapping(Xaml::TextWrapping::Wrap);
+        if (!nativeText.empty()) endpointTitle.Style(nativeText[0].Style());
+        if (nativeText.size() > 1) endpointDescription.Style(nativeText[1].Style());
+
+        Controls::StackPanel endpointLabels;
+        endpointLabels.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        endpointLabels.Children().Append(endpointTitle);
+        endpointLabels.Children().Append(endpointDescription);
+
+        Controls::ComboBox endpointCombo;
+        endpointCombo.Name(L"AMExclusiveEndpointCombo");
+        endpointCombo.Width(220.0);
+        endpointCombo.VerticalAlignment(Xaml::VerticalAlignment::Center);
+        Automation::AutomationProperties::SetName(
+            endpointCombo, Localized(L"输出设备", L"Output device"));
+        Automation::AutomationProperties::SetHelpText(
+            endpointCombo, Localized(L"选择用于 WASAPI 独占输出的音频设备",
+                                     L"Select the audio device for WASAPI exclusive output"));
+        WireEndpointCombo(endpointCombo);
+
+        Controls::ColumnDefinition endpointLabelColumn;
+        endpointLabelColumn.Width(Xaml::GridLength{1.0, Xaml::GridUnitType::Star});
+        Controls::ColumnDefinition endpointComboColumn;
+        endpointComboColumn.Width(Xaml::GridLength{1.0, Xaml::GridUnitType::Auto});
+        Controls::Grid endpointContent;
+        endpointContent.ColumnDefinitions().Append(endpointLabelColumn);
+        endpointContent.ColumnDefinitions().Append(endpointComboColumn);
+        endpointContent.Children().Append(endpointLabels);
+        endpointContent.Children().Append(endpointCombo);
+        Controls::Grid::SetColumn(endpointCombo, 1);
+
+        Controls::Border endpointCard;
+        endpointCard.Name(L"AMExclusiveEndpointCard");
+        endpointCard.Child(endpointContent);
+        endpointCard.Background(card.Background());
+        endpointCard.BorderBrush(card.BorderBrush());
+        endpointCard.BorderThickness(card.BorderThickness());
+        endpointCard.CornerRadius(card.CornerRadius());
+        endpointCard.Padding(card.Padding());
+        endpointCard.Margin(card.Margin());
+        endpointCard.HorizontalAlignment(card.HorizontalAlignment());
+        endpointCard.VerticalAlignment(card.VerticalAlignment());
+        endpointCard.MinHeight(card.MinHeight());
+        endpointCard.MaxWidth(card.MaxWidth());
+        target.Children().Append(endpointCard);
+
         RememberToggle(toggle);
         RememberHardwareBufferBox(bufferInput);
+        RememberEndpointCombo(endpointCombo);
         ApplyStatus(toggle);
         ApplyHardwareBufferStatus(bufferInput);
+        ApplyEndpointsToCombo(endpointCombo);
         Log(L"Exclusive mode settings card attached to PlaybackSettingsPage");
         Log(L"Hardware buffer settings card attached to PlaybackSettingsPage");
+        Log(L"Output device settings card attached to PlaybackSettingsPage");
     } catch (const hresult_error& error) {
         std::wostringstream text;
         text << L"UI attach failed hr=0x" << std::hex << error.code().value << L" " << error.message().c_str();
@@ -1500,6 +1791,27 @@ DWORD WINAPI PipeThread(void*) {
                 }
                 g_hardwareBufferAckDeadlineTick.store(GetTickCount64() + 1000);
             }
+            if (g_hasPendingEndpoint.exchange(false)) {
+                std::wstring pendingId;
+                {
+                    std::lock_guard lock(g_endpointMutex);
+                    pendingId = g_pendingEndpointId;
+                }
+                auto message = NewMessage(MessageType::SetEndpoint, Role::Ui);
+                message.uiPid = GetCurrentProcessId();
+                wcsncpy_s(message.selectedEndpointId, pendingId.c_str(), _TRUNCATE);
+                bool written{};
+                {
+                    std::lock_guard writeLock(g_pipeWriteMutex);
+                    written = WriteMessage(pipe, message);
+                }
+                if (!written) {
+                    std::lock_guard lock(g_endpointMutex);
+                    g_pendingEndpointId = pendingId;
+                    g_hasPendingEndpoint.store(true);
+                    break;
+                }
+            }
             if (!ReadMessageTimeout(pipe, incoming, 100)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
                     const int requested = g_requestedHardwareBufferMs.load();
@@ -1531,6 +1843,8 @@ DWORD WINAPI PipeThread(void*) {
                         std::to_wstring(requested));
                 }
                 ScheduleStatusRefresh();
+            } else if (incoming.type == MessageType::EndpointList) {
+                ParseAndApplyEndpointList(incoming.detail);
             } else if (incoming.type == MessageType::Goodbye) {
                 break;
             }

@@ -5,6 +5,9 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <tlhelp32.h>
+#include <mmdeviceapi.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <propsys.h>
 
 #include <algorithm>
 #include <atomic>
@@ -48,6 +51,87 @@ bool WriteHardwareBufferMs(std::uint32_t milliseconds) {
     }
     (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
     return ReadHardwareBufferMs() == milliseconds;
+}
+
+std::wstring ReadSelectedEndpointId() {
+    wchar_t value[ammod::ipc::kEndpointIdChars]{};
+    GetPrivateProfileStringW(L"mod", L"selected_endpoint_id", L"", value,
+        static_cast<DWORD>(std::size(value)), BrokerIniPath().c_str());
+    return value;
+}
+
+bool WriteSelectedEndpointId(const std::wstring& id) {
+    const auto path = BrokerIniPath();
+    if (!WritePrivateProfileStringW(L"mod", L"selected_endpoint_id",
+                                    id.empty() ? L"" : id.c_str(), path.c_str())) {
+        return false;
+    }
+    (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+    return true;
+}
+
+// Enumerate active WASAPI render endpoints.
+// Returns a newline-delimited list of "id\tFriendlyName" entries.
+// The first entry is always the system-default device (id = empty string).
+std::wstring BuildEndpointList() {
+    const HRESULT coinit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool uninit = coinit == S_OK || coinit == S_FALSE;
+
+    std::wstring result;
+    // System default as first entry (empty id)
+    const bool chinese = UseChineseUi();
+    result += L"\t";
+    result += chinese ? L"系统默认设备" : L"System default device";
+
+    IMMDeviceEnumerator* enumerator{};
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                                   CLSCTX_INPROC_SERVER, __uuidof(IMMDeviceEnumerator),
+                                   reinterpret_cast<void**>(&enumerator))) && enumerator) {
+        IMMDeviceCollection* collection{};
+        if (SUCCEEDED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE,
+                                                      &collection)) && collection) {
+            UINT count{};
+            collection->GetCount(&count);
+            for (UINT index = 0; index < count; ++index) {
+                IMMDevice* device{};
+                if (FAILED(collection->Item(index, &device)) || !device) continue;
+
+                LPWSTR deviceId{};
+                if (FAILED(device->GetId(&deviceId)) || !deviceId) {
+                    device->Release();
+                    continue;
+                }
+                const std::wstring id(deviceId);
+                CoTaskMemFree(deviceId);
+
+                std::wstring name;
+                IPropertyStore* props{};
+                if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &props)) && props) {
+                    PROPVARIANT var;
+                    PropVariantInit(&var);
+                    if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &var)) &&
+                        var.vt == VT_LPWSTR && var.pwszVal) {
+                        name = var.pwszVal;
+                    }
+                    PropVariantClear(&var);
+                    props->Release();
+                }
+                if (name.empty()) name = id;
+
+                result += L'\n';
+                result += id;
+                result += L'\t';
+                result += name;
+
+                device->Release();
+            }
+            collection->Release();
+        }
+        enumerator->Release();
+    }
+
+    if (uninit) CoUninitialize();
+    return result;
 }
 
 using namespace ammod::ipc;
@@ -675,10 +759,27 @@ void HandleMessage(const Message& incoming, HANDLE source) {
                         std::to_wstring(GetLastError()));
                 }
             }
+        } else if (incoming.type == MessageType::SetEndpoint &&
+                   (incoming.role == Role::Ui || incoming.role == Role::Controller)) {
+            // Persist the chosen endpoint GUID (may be empty = system default)
+            const std::wstring newId(incoming.selectedEndpointId);
+            if (WriteSelectedEndpointId(newId)) {
+                g_status.generation++;
+                wcsncpy_s(g_status.selectedEndpointId, newId.c_str(), _TRUNCATE);
+                g_status.error = ErrorCategory::None;
+                g_status.hresult = S_OK;
+                Log(L"selected endpoint persisted id=" + newId);
+            } else {
+                Log(L"selected endpoint persistence failed id=" + newId +
+                    L" error=" + std::to_wstring(GetLastError()));
+            }
         } else if (incoming.type == MessageType::StatusChanged) {
             const auto generation = std::max(g_status.generation + 1, incoming.generation);
             const auto persistedIntent = g_status.enabledIntent;
             const auto persistedHardwareBufferMs = g_status.hardwareBufferMs;
+            // Preserve the broker-owned selected endpoint across Agent events.
+            wchar_t persistedEndpointId[ammod::ipc::kEndpointIdChars];
+            wcsncpy_s(persistedEndpointId, g_status.selectedEndpointId, _TRUNCATE);
             g_status = incoming;
             g_status.type = MessageType::StatusChanged;
             g_status.role = Role::Broker;
@@ -690,6 +791,7 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             if (incoming.role == Role::Agent) {
                 g_status.enabledIntent = persistedIntent;
                 g_status.hardwareBufferMs = persistedHardwareBufferMs;
+                wcsncpy_s(g_status.selectedEndpointId, persistedEndpointId, _TRUNCATE);
                 if (persistedIntent && incoming.state == RuntimeState::Off) {
                     g_status.state = RuntimeState::WaitingForStream;
                 }
@@ -698,11 +800,14 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             const auto generation = std::max(g_status.generation + 1, incoming.generation);
             const auto persistedIntent = g_status.enabledIntent;
             const auto persistedHardwareBufferMs = g_status.hardwareBufferMs;
+            wchar_t persistedEndpointId[ammod::ipc::kEndpointIdChars];
+            wcsncpy_s(persistedEndpointId, g_status.selectedEndpointId, _TRUNCATE);
             g_status = incoming;
             g_status.type = MessageType::StatusChanged;
             g_status.role = Role::Broker;
             g_status.generation = generation;
             g_status.hardwareBufferMs = persistedHardwareBufferMs;
+            wcsncpy_s(g_status.selectedEndpointId, persistedEndpointId, _TRUNCATE);
             if (persistedIntent) {
                 // Retire the failed attempt, not the user's AME preference.
                 // The Agent receives this status and arms a fresh generation
@@ -722,6 +827,11 @@ void HandleMessage(const Message& incoming, HANDLE source) {
         g_status.senderPid = GetCurrentProcessId();
         GetSystemTimeAsFileTime(&g_status.timestampUtc);
         status = g_status;
+    }
+    // For SetEndpoint: also relay to Agent so it can apply the new endpoint
+    // on the next song boundary (same as SetHardwareBuffer pattern).
+    if (incoming.type == MessageType::SetEndpoint) {
+        BroadcastToRole(status, Role::Agent);
     }
     Broadcast(status, source);
     if (showError) ShowErrorDialogAsync(status.error, status.hresult, status.generation);
@@ -783,6 +893,18 @@ void ClientThread(HANDLE pipe) {
     Log(L"hello complete pid=" + std::to_wstring(hello.senderPid));
     if (publishAgentBoundary) Broadcast(initialStatus, nullptr);
 
+    // Send UI clients an initial device list so the ComboBox can populate
+    // without waiting for user interaction.
+    if (hello.role == Role::Ui || hello.role == Role::Controller) {
+        const auto list = BuildEndpointList();
+        auto listMsg = NewMessage(MessageType::EndpointList, Role::Broker);
+        listMsg.senderPid = GetCurrentProcessId();
+        GetSystemTimeAsFileTime(&listMsg.timestampUtc);
+        wcsncpy_s(listMsg.detail, list.c_str(), _TRUNCATE);
+        Log(L"sending endpoint list to UI pid=" + std::to_wstring(hello.senderPid));
+        WriteMessage(pipe, listMsg);
+    }
+
     Message incoming{};
     for (;;) {
         if (!ReadMessageTimeout(pipe, incoming, 250)) {
@@ -790,8 +912,17 @@ void ClientThread(HANDLE pipe) {
             break;
         }
         if (incoming.type == MessageType::Goodbye) break;
-        if (incoming.type == MessageType::GetStatus) PublishStatus(pipe);
-        else HandleMessage(incoming, pipe);
+        if (incoming.type == MessageType::GetStatus) {
+            PublishStatus(pipe);
+            const auto list = BuildEndpointList();
+            auto listMsg = NewMessage(MessageType::EndpointList, Role::Broker);
+            listMsg.senderPid = GetCurrentProcessId();
+            GetSystemTimeAsFileTime(&listMsg.timestampUtc);
+            wcsncpy_s(listMsg.detail, list.c_str(), _TRUNCATE);
+            WriteMessage(pipe, listMsg);
+        } else {
+            HandleMessage(incoming, pipe);
+        }
     }
     RemoveClient(pipe);
     DisconnectNamedPipe(pipe);
@@ -817,6 +948,10 @@ int wmain() {
         static_cast<DWORD>(std::size(savedMode)), BrokerIniPath().c_str());
     g_status.enabledIntent = _wcsicmp(savedMode, L"exclusive") == 0 ? 1 : 0;
     g_status.hardwareBufferMs = ReadHardwareBufferMs();
+    {
+        const auto savedId = ReadSelectedEndpointId();
+        wcsncpy_s(g_status.selectedEndpointId, savedId.c_str(), _TRUNCATE);
+    }
     g_status.state = g_status.enabledIntent ? RuntimeState::WaitingForStream : RuntimeState::Off;
     Log(L"companion started pid=" + std::to_wstring(GetCurrentProcessId()) +
         L" persistedIntent=" + std::to_wstring(g_status.enabledIntent) +

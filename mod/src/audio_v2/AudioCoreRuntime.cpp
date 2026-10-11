@@ -183,6 +183,14 @@ void AudioCoreRuntime::SetHardwareBufferMilliseconds(std::uint32_t milliseconds)
     hardwareBufferMs_.store(milliseconds, std::memory_order_release);
 }
 
+void AudioCoreRuntime::SetEndpointId(std::wstring id) noexcept {
+    // Mirror SetHardwareBufferMilliseconds: arm the new ID now; the worker
+    // picks it up when it opens the next WasapiExclusiveSink. Never tear
+    // down a running exclusive session just because the user changed device.
+    std::lock_guard lock(controlMutex_);
+    pendingEndpointId_ = std::move(id);
+}
+
 void AudioCoreRuntime::OnTransportPlayPause() noexcept {
     if (!UiEnabled()) return;
     std::lock_guard lock(controlMutex_);
@@ -1266,7 +1274,7 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
             PcmEncoding::SignedInteger, true,
             static_cast<std::uint16_t>(snapshot.registration.sourceBitDepth)};
     }
-    config.sink.endpointId = nativeEndpoint_;
+    config.sink.endpointId = pendingEndpointId_.empty() ? nativeEndpoint_ : pendingEndpointId_;
     config.sink.periodFrames = PeriodFrames(format.sampleRate);
     config.sink.alignmentRetries = 3;
     config.sink.lifecycleContext = callbacks_.context;

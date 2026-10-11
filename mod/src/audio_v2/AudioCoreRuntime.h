@@ -103,6 +103,10 @@ public:
     void Stop() noexcept;
     void SetUiEnabled(bool enabled) noexcept;
     void SetHardwareBufferMilliseconds(std::uint32_t milliseconds) noexcept;
+    // Set the WASAPI endpoint GUID to use for the next exclusive session.
+    // Empty string = use the system default output device.
+    // Applied on the next naturally opened sink; never disturbs the current song.
+    void SetEndpointId(std::wstring id) noexcept;
     bool UiEnabled() const noexcept { return uiEnabled_.load(std::memory_order_acquire); }
 
     // UI transport intents are control-plane only. They gate when the exact
@@ -227,6 +231,10 @@ private:
     std::atomic<bool> uiEnabled_{};
     std::atomic<bool> workerStop_{};
     std::atomic<std::uint32_t> hardwareBufferMs_{20};
+    // Preferred WASAPI endpoint GUID; empty = system default.
+    // Written by SetEndpointId() (control/UI thread) and read under
+    // controlMutex_ when building a new WasapiSinkConfig.
+    std::wstring pendingEndpointId_;
     HANDLE wakeEvent_{};
     HANDLE workerThread_{};
 
