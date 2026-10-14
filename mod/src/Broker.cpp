@@ -816,7 +816,7 @@ void HandleMessage(const Message& incoming, HANDLE source) {
                 // for the next naturally opened song.
                 g_status.enabledIntent = persistedIntent;
                 g_status.state = RuntimeState::WaitingForStream;
-                showError = true;
+                showError = (incoming.error != ErrorCategory::DeviceInUse);
             } else {
                 g_status.enabledIntent = 0;
                 g_status.state = RuntimeState::Off;

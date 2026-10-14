@@ -90,10 +90,23 @@ HRESULT WasapiExclusiveSink::Open(const WasapiSinkConfig& config) noexcept {
             hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, &device_);
         } else {
             hr = enumerator_->GetDevice(config_.endpointId.c_str(), &device_);
+            if (FAILED(hr)) {
+                // If custom endpoint cannot be opened (e.g. unplugged), fallback to default
+                hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, &device_);
+            }
         }
     }
-    if (SUCCEEDED(hr)) hr = ActivateClient();
-    if (SUCCEEDED(hr)) hr = InitializeClient();
+    if (SUCCEEDED(hr)) {
+        // USB DACs and kernel audio endpoints often require 20-150ms to release
+        // exclusive mode from the preceding track. Retry on AUDCLNT_E_DEVICE_IN_USE.
+        for (std::uint32_t retry = 0; retry < 6; ++retry) {
+            hr = ActivateClient();
+            if (SUCCEEDED(hr)) hr = InitializeClient();
+            if (hr != AUDCLNT_E_DEVICE_IN_USE) break;
+            Release(client_);
+            Sleep(35);
+        }
+    }
     if (FAILED(hr)) {
         RecordError(hr);
         ReleaseInterfaces();
@@ -115,8 +128,14 @@ HRESULT WasapiExclusiveSink::ActivateClient() noexcept {
     Release(render_);
     Release(client_);
     ScopedNativeProxyBypass bypass;
-    return device_->Activate(__uuidof(IAudioClient), CLSCTX_INPROC_SERVER, nullptr,
-                             reinterpret_cast<void**>(&client_));
+    HRESULT hr = E_FAIL;
+    for (int retry = 0; retry < 5; ++retry) {
+        hr = device_->Activate(__uuidof(IAudioClient), CLSCTX_INPROC_SERVER, nullptr,
+                               reinterpret_cast<void**>(&client_));
+        if (hr != AUDCLNT_E_DEVICE_IN_USE) break;
+        Sleep(25);
+    }
+    return hr;
 }
 
 HRESULT WasapiExclusiveSink::InitializeClient() noexcept {
@@ -152,8 +171,14 @@ HRESULT WasapiExclusiveSink::InitializeClient() noexcept {
         REFERENCE_TIME period = requested;
         bool unsupported = false;
         for (std::uint32_t attempt = 0; attempt < attempts; ++attempt) {
-            HRESULT hr = client_->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
-                                                     &waveFormat_.Format, nullptr);
+            HRESULT hr = S_OK;
+            for (int inUseRetry = 0; inUseRetry < 5; ++inUseRetry) {
+                hr = client_->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                                &waveFormat_.Format, nullptr);
+                if (hr != AUDCLNT_E_DEVICE_IN_USE) break;
+                Sleep(25);
+                ActivateClient();
+            }
             if (hr == S_FALSE) hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
             if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
                 unsupported = true;
@@ -161,9 +186,14 @@ HRESULT WasapiExclusiveSink::InitializeClient() noexcept {
             }
             if (FAILED(hr)) return finish(hr);
 
-            hr = client_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
-                period, period, &waveFormat_.Format, nullptr);
+            for (int inUseRetry = 0; inUseRetry < 5; ++inUseRetry) {
+                hr = client_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
+                    period, period, &waveFormat_.Format, nullptr);
+                if (hr != AUDCLNT_E_DEVICE_IN_USE) break;
+                Sleep(25);
+                ActivateClient();
+            }
             if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
                 unsupported = true;
                 break;
