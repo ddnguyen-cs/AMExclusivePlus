@@ -1705,9 +1705,30 @@ void CopyText(wchar_t (&destination)[N], std::wstring_view source) {
     destination[count] = L'\0';
 }
 
+std::wstring AudioSampleFormatText(std::uint32_t sampleRate, std::uint32_t bitDepth) {
+    if (sampleRate == 0) return {};
+    std::wostringstream out;
+    if (bitDepth > 0) {
+        out << bitDepth << L"-bit / ";
+    }
+    if (sampleRate % 1000 == 0) {
+        out << (sampleRate / 1000);
+    } else if (sampleRate % 100 == 0) {
+        out << (sampleRate / 1000) << L'.' << ((sampleRate % 1000) / 100);
+    } else {
+        wchar_t rateBuf[32];
+        swprintf_s(rateBuf, L"%.1f", sampleRate / 1000.0);
+        out << rateBuf;
+    }
+    out << L" kHz";
+    return out.str();
+}
+
 void SendAgentEvent(ammod::ipc::MessageType type, ammod::ipc::RuntimeState state,
-                    bool enabled, const std::wstring& endpoint = {},
-                    const WAVEFORMATEX* format = nullptr, HRESULT hr = S_OK,
+                    bool enabled, const std::wstring& endpointId = {},
+                    const std::wstring& endpointName = {},
+                    const std::wstring& formatText = {},
+                    HRESULT hr = S_OK,
                     ammod::ipc::ErrorCategory category = ammod::ipc::ErrorCategory::None,
                     const std::wstring& detail = {}) {
     using namespace ammod::ipc;
@@ -1718,8 +1739,9 @@ void SendAgentEvent(ammod::ipc::MessageType type, ammod::ipc::RuntimeState state
     message.enabledIntent = enabled ? 1 : 0;
     message.hresult = hr;
     message.error = category;
-    CopyText(message.endpointId, endpoint);
-    CopyText(message.format, FormatText(format));
+    CopyText(message.endpointId, endpointId);
+    CopyText(message.endpointName, endpointName);
+    CopyText(message.format, formatText);
     CopyText(message.detail, detail);
     std::lock_guard lock(g_outboundMutex);
     g_outbound.push_back(message);
@@ -1775,8 +1797,14 @@ void AudioCoreRuntimeEventCallback(void* context,
             std::to_wstring(format.containerBits) + L" sourceBits=" +
             std::to_wstring(sourceBits) + L" encoding=signed-int interleaved=1}");
         Log(L"audio core v2 active qpc=" + std::to_wstring(CurrentQpc()));
+
+        const auto endpointId = runtime->Coordinator().EndpointId();
+        const auto endpointName = runtime->Coordinator().EndpointName();
+        const auto formatString = AudioSampleFormatText(format.sampleRate, sourceBits);
+
         SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
-                       ammod::ipc::RuntimeState::Active, true);
+                       ammod::ipc::RuntimeState::Active, true,
+                       endpointId, endpointName, formatString);
         break;
     }
     case ammod::audio_v2::AudioCoreRuntimeEvent::Faulted: {
@@ -1796,7 +1824,7 @@ void AudioCoreRuntimeEventCallback(void* context,
         }
         SendAgentEvent(ammod::ipc::MessageType::AttemptFailed,
                        ammod::ipc::RuntimeState::WaitingForStream,
-                       true, {}, nullptr, result,
+                       true, {}, {}, {}, result,
                        ammod::ipc::CategorizeAudioError(result),
                        playbackRejected ? L"audio_core_v2_playback_rejected"
                                         : L"audio_core_v2_faulted");
@@ -3399,7 +3427,8 @@ void DisableExclusiveIntent(const std::wstring& reason, HRESULT hr,
     if (category == ammod::ipc::ErrorCategory::None) category = ammod::ipc::CategorizeAudioError(hr);
     SendAgentEvent(ammod::ipc::MessageType::AttemptFailed,
                    ammod::ipc::RuntimeState::WaitingForStream,
-                   true, endpoint, format, hr, category, reason);
+                   true, endpoint, {}, format ? FormatText(format) : std::wstring{},
+                   hr, category, reason);
 }
 
 DWORD WINAPI PipeClientLoop(void*) {

@@ -3,6 +3,8 @@
 #include "../AudioErrors.h"
 
 #include <avrt.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <propsys.h>
 
 #include <algorithm>
 #include <cstring>
@@ -93,6 +95,24 @@ HRESULT WasapiExclusiveSink::Open(const WasapiSinkConfig& config) noexcept {
             if (FAILED(hr)) {
                 // If custom endpoint cannot be opened (e.g. unplugged), fallback to default
                 hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, &device_);
+            }
+        }
+        if (SUCCEEDED(hr) && device_) {
+            LPWSTR devId{};
+            if (SUCCEEDED(device_->GetId(&devId)) && devId) {
+                endpointId_ = devId;
+                CoTaskMemFree(devId);
+            }
+            IPropertyStore* props{};
+            if (SUCCEEDED(device_->OpenPropertyStore(STGM_READ, &props)) && props) {
+                PROPVARIANT var;
+                PropVariantInit(&var);
+                if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &var)) &&
+                    var.vt == VT_LPWSTR && var.pwszVal) {
+                    endpointName_ = var.pwszVal;
+                }
+                PropVariantClear(&var);
+                props->Release();
             }
         }
     }
@@ -541,6 +561,8 @@ void WasapiExclusiveSink::ReleaseInterfaces() noexcept {
     }
     Release(device_);
     Release(enumerator_);
+    endpointId_.clear();
+    endpointName_.clear();
     std::fill(canonicalBuffer_.begin(), canonicalBuffer_.end(), 0);
     canonicalBuffer_.clear();
     bufferFrames_ = 0;

@@ -71,6 +71,8 @@ public:
     const PcmFormat& Format() const noexcept {
         return sink_.State() == WasapiSinkState::Closed ? config_.sink.format : sink_.Format();
     }
+    const std::wstring& EndpointId() const noexcept { return sink_.EndpointId(); }
+    const std::wstring& EndpointName() const noexcept { return sink_.EndpointName(); }
     std::uint64_t MediaGeneration() const noexcept { return config_.mediaGeneration; }
     const AudioCoreCoordinatorStats Stats() const noexcept;
     const WasapiExclusiveSink& Sink() const noexcept { return sink_; }

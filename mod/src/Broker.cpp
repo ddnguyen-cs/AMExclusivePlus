@@ -798,6 +798,9 @@ void HandleMessage(const Message& incoming, HANDLE source) {
                     g_status.state = RuntimeState::WaitingForStream;
                 }
             }
+            if (g_status.state != RuntimeState::Active) {
+                g_status.format[0] = L'\0';
+            }
         } else if (incoming.type == MessageType::AttemptFailed) {
             const auto generation = std::max(g_status.generation + 1, incoming.generation);
             const auto persistedIntent = g_status.enabledIntent;
@@ -809,6 +812,7 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             g_status.role = Role::Broker;
             g_status.generation = generation;
             g_status.hardwareBufferMs = persistedHardwareBufferMs;
+            g_status.format[0] = L'\0';
             wcsncpy_s(g_status.selectedEndpointId, persistedEndpointId, _TRUNCATE);
             if (persistedIntent) {
                 // Retire the failed attempt, not the user's AME preference.

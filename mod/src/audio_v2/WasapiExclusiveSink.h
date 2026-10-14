@@ -114,6 +114,8 @@ public:
     WasapiSinkState State() const noexcept { return state_.load(std::memory_order_acquire); }
     WasapiSinkStats Stats() const noexcept;
     const PcmFormat& Format() const noexcept { return config_.format; }
+    const std::wstring& EndpointId() const noexcept { return endpointId_; }
+    const std::wstring& EndpointName() const noexcept { return endpointName_; }
     bool WaitingForSource() const noexcept {
         return waitingForSource_.load(std::memory_order_acquire);
     }
@@ -138,6 +140,8 @@ private:
     void ReleaseInterfaces() noexcept;
 
     WasapiSinkConfig config_{};
+    std::wstring endpointId_;
+    std::wstring endpointName_;
     WAVEFORMATEXTENSIBLE waveFormat_{};
     std::vector<std::int32_t> canonicalBuffer_;
 

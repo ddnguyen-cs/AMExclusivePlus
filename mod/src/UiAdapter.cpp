@@ -90,6 +90,7 @@ winrt::weak_ref<Controls::ToggleSwitch> g_toggle;
 winrt::weak_ref<Controls::TextBox> g_hardwareBufferBox;
 winrt::weak_ref<Controls::ComboBox> g_dacComboSettings;
 winrt::weak_ref<Controls::ComboBox> g_dacComboNowPlaying;
+winrt::weak_ref<Controls::TextBlock> g_nowPlayingFormatText;
 
 struct EndpointItem {
     std::wstring id;
@@ -387,6 +388,28 @@ void RememberEndpointCombo(const Controls::ComboBox& combo, bool isNowPlaying = 
     }
     auto current = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
     if (!g_dispatcher) g_dispatcher = current ? current : combo.DispatcherQueue();
+}
+
+void RememberNowPlayingFormatText(const Controls::TextBlock& text) {
+    std::lock_guard lock(g_uiTargetMutex);
+    g_nowPlayingFormatText = make_weak(text);
+    auto current = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+    if (!g_dispatcher) g_dispatcher = current ? current : text.DispatcherQueue();
+}
+
+void ApplyNowPlayingFormat(const Controls::TextBlock& text) {
+    if (!text) return;
+    const auto status = StatusSnapshot();
+    if (status.state == RuntimeState::Active && status.format[0] != L'\0') {
+        const std::wstring formatStr = status.format;
+        if (text.Text() != formatStr) {
+            text.Text(formatStr);
+        }
+    } else {
+        if (!text.Text().empty()) {
+            text.Text(L"");
+        }
+    }
 }
 
 void QueueTransport(std::wstring_view action, std::uint64_t epoch = 0) {
@@ -817,6 +840,7 @@ void ApplyStatus(const Controls::ToggleSwitch& toggle) {
     if (status.state == RuntimeState::Active) {
         presentation = Localized(L"已启用", L"Enabled");
         if (status.endpointName[0]) presentation += L" · " + std::wstring(status.endpointName);
+        if (status.format[0]) presentation += L" · " + std::wstring(status.format);
     } else if (status.state == RuntimeState::DisablePending) {
         presentation = Localized(L"正在恢复共享输出…", L"Restoring shared output…");
     } else if (status.state == RuntimeState::Requested ||
@@ -896,17 +920,20 @@ void RememberToggle(const Controls::ToggleSwitch& toggle) {
             winrt::weak_ref<Controls::TextBox> hardwareBuffer;
             winrt::weak_ref<Controls::ComboBox> dacSettings;
             winrt::weak_ref<Controls::ComboBox> dacNowPlaying;
+            winrt::weak_ref<Controls::TextBlock> nowPlayingFormat;
             {
                 std::lock_guard targetLock(g_uiTargetMutex);
                 target = g_toggle;
                 hardwareBuffer = g_hardwareBufferBox;
                 dacSettings = g_dacComboSettings;
                 dacNowPlaying = g_dacComboNowPlaying;
+                nowPlayingFormat = g_nowPlayingFormatText;
             }
             if (auto control = target.get()) ApplyStatus(control);
             if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
             if (auto combo = dacSettings.get()) ApplyEndpointsToCombo(combo);
             if (auto combo = dacNowPlaying.get()) ApplyEndpointsToCombo(combo);
+            if (auto text = nowPlayingFormat.get()) ApplyNowPlayingFormat(text);
         });
         g_statusRefreshTimer.Start();
         Log(L"UI status refresh timer started intervalMs=250");
@@ -926,6 +953,7 @@ void ScheduleStatusRefresh() {
     winrt::weak_ref<Controls::TextBox> hardwareBuffer;
     winrt::weak_ref<Controls::ComboBox> dacSettings;
     winrt::weak_ref<Controls::ComboBox> dacNowPlaying;
+    winrt::weak_ref<Controls::TextBlock> nowPlayingFormat;
     Microsoft::UI::Dispatching::DispatcherQueue dispatcher{nullptr};
     {
         std::lock_guard lock(g_uiTargetMutex);
@@ -933,14 +961,16 @@ void ScheduleStatusRefresh() {
         hardwareBuffer = g_hardwareBufferBox;
         dacSettings = g_dacComboSettings;
         dacNowPlaying = g_dacComboNowPlaying;
+        nowPlayingFormat = g_nowPlayingFormatText;
         dispatcher = g_dispatcher;
     }
     if (dispatcher) {
-        dispatcher.TryEnqueue([toggle, hardwareBuffer, dacSettings, dacNowPlaying] {
+        dispatcher.TryEnqueue([toggle, hardwareBuffer, dacSettings, dacNowPlaying, nowPlayingFormat] {
             if (auto control = toggle.get()) ApplyStatus(control);
             if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
             if (auto combo = dacSettings.get()) ApplyEndpointsToCombo(combo);
             if (auto combo = dacNowPlaying.get()) ApplyEndpointsToCombo(combo);
+            if (auto text = nowPlayingFormat.get()) ApplyNowPlayingFormat(text);
         });
     }
 }
@@ -989,6 +1019,10 @@ void AttachNowPlayingDacSelector(const Xaml::DependencyObject& content, const Xa
         if (auto existing = FindByName(content, L"AMExclusiveNowPlayingDacCombo").try_as<Controls::ComboBox>()) {
             RememberEndpointCombo(existing, true);
             ApplyEndpointsToCombo(existing);
+        }
+        if (auto existingText = FindByName(content, L"AMExclusiveNowPlayingFormatText").try_as<Controls::TextBlock>()) {
+            RememberNowPlayingFormatText(existingText);
+            ApplyNowPlayingFormat(existingText);
         }
         return;
     }
@@ -1051,22 +1085,41 @@ void AttachNowPlayingDacSelector(const Xaml::DependencyObject& content, const Xa
     nowPlayingCombo.Height(28.0);
     nowPlayingCombo.FontSize(11.0);
     nowPlayingCombo.VerticalAlignment(Xaml::VerticalAlignment::Center);
-    nowPlayingCombo.Margin(Xaml::Thickness{6, 0, 6, 0});
+    nowPlayingCombo.Margin(Xaml::Thickness{6, 0, 4, 0});
     Automation::AutomationProperties::SetName(
         nowPlayingCombo, Localized(L"输出设备", L"Output device"));
     Automation::AutomationProperties::SetHelpText(
         nowPlayingCombo, Localized(L"选择用于 WASAPI 独占输出的音频设备",
                                    L"Select the audio device for WASAPI exclusive output"));
 
+    Controls::TextBlock nowPlayingFormatText;
+    nowPlayingFormatText.Name(L"AMExclusiveNowPlayingFormatText");
+    nowPlayingFormatText.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    nowPlayingFormatText.FontSize(11.0);
+    nowPlayingFormatText.Margin(Xaml::Thickness{2, 0, 6, 0});
+    if (auto secondaryBrush = ThemeBrush(L"TextFillColorSecondaryBrush")) {
+        nowPlayingFormatText.Foreground(secondaryBrush);
+    }
+    Automation::AutomationProperties::SetName(
+        nowPlayingFormatText, Localized(L"音频采样率", L"Audio sample format"));
+    Controls::ToolTipService::SetToolTip(
+        nowPlayingFormatText,
+        box_value(hstring(Localized(L"WASAPI 独占输出音频采样率",
+                                    L"WASAPI Exclusive audio stream format"))));
+
     WireEndpointCombo(nowPlayingCombo);
     if (auto stack = anchorPanel.try_as<Controls::StackPanel>()) {
         stack.Children().Append(nowPlayingCombo);
+        stack.Children().Append(nowPlayingFormatText);
     } else {
         anchorPanel.Children().Append(nowPlayingCombo);
+        anchorPanel.Children().Append(nowPlayingFormatText);
     }
     RememberEndpointCombo(nowPlayingCombo, true);
+    RememberNowPlayingFormatText(nowPlayingFormatText);
     ApplyEndpointsToCombo(nowPlayingCombo);
-    Log(L"Now playing DAC selector attached to transport panel");
+    ApplyNowPlayingFormat(nowPlayingFormatText);
+    Log(L"Now playing DAC selector and format display attached to transport panel");
 }
 
 void AttachTransportObservers() {
