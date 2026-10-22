@@ -86,7 +86,8 @@ std::uint64_t g_lastTrackRowPressEpoch{};
 ULONGLONG g_lastTrackRowPressTick{};
 HWINEVENTHOOK g_windowLifecycleHook{};
 HWND g_mainWindow{};
-winrt::weak_ref<Controls::ToggleSwitch> g_toggle;
+winrt::weak_ref<Controls::ToggleSwitch> g_toggleSettings;
+winrt::weak_ref<Controls::ToggleSwitch> g_toggleNowPlaying;
 winrt::weak_ref<Controls::TextBox> g_hardwareBufferBox;
 winrt::weak_ref<Controls::ComboBox> g_dacComboSettings;
 winrt::weak_ref<Controls::ComboBox> g_dacComboNowPlaying;
@@ -906,30 +907,72 @@ void CommitHardwareBuffer(const Controls::TextBox& input) {
         std::to_wstring(milliseconds));
 }
 
-void RememberToggle(const Controls::ToggleSwitch& toggle) {
+void WireExclusiveToggle(const Controls::ToggleSwitch& toggle) {
+    toggle.Toggled([](winrt::Windows::Foundation::IInspectable const& sender,
+                      Xaml::RoutedEventArgs const&) {
+        if (g_suppressToggle.load()) return;
+        auto control = sender.as<Controls::ToggleSwitch>();
+        const bool enabled = control.IsOn();
+        int marker = g_programmaticToggleValue.load();
+        if (marker == (enabled ? 1 : 0) &&
+            g_programmaticToggleValue.compare_exchange_strong(marker, -1)) {
+            Log(std::wstring(L"ignored delayed programmatic toggle event enabled=") +
+                (enabled ? L"1" : L"0"));
+            return;
+        }
+        if (enabled == (StatusSnapshot().enabledIntent != 0)) {
+            Log(std::wstring(L"ignored broker-driven toggle event enabled=") +
+                (enabled ? L"1" : L"0"));
+            return;
+        }
+        Log(std::wstring(L"user toggled exclusive mode enabled=") +
+            (enabled ? L"1" : L"0"));
+        control.IsEnabled(false);
+        if (!SendEnabled(enabled)) {
+            g_suppressToggle.store(true);
+            g_programmaticToggleValue.store(0);
+            control.IsOn(false);
+            control.IsEnabled(true);
+            if (auto statusText = FindStatusText(control)) {
+                statusText.Text(Localized(L"独占音频组件无法启动",
+                                          L"The exclusive audio component could not start"));
+            }
+            g_suppressToggle.store(false);
+        }
+    });
+}
+
+void RememberToggle(const Controls::ToggleSwitch& toggle, bool isNowPlaying = false) {
     std::lock_guard lock(g_uiTargetMutex);
-    g_toggle = make_weak(toggle);
+    if (isNowPlaying) {
+        g_toggleNowPlaying = make_weak(toggle);
+    } else {
+        g_toggleSettings = make_weak(toggle);
+    }
     auto current = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
-    g_dispatcher = current ? current : toggle.DispatcherQueue();
+    if (!g_dispatcher) g_dispatcher = current ? current : toggle.DispatcherQueue();
     if (!g_statusRefreshTimer && g_dispatcher) {
         g_statusRefreshTimer = g_dispatcher.CreateTimer();
         g_statusRefreshTimer.Interval(std::chrono::milliseconds(250));
         g_statusRefreshTimer.IsRepeating(true);
         g_statusRefreshTimer.Tick([](auto&&, auto&&) {
-            winrt::weak_ref<Controls::ToggleSwitch> target;
+            winrt::weak_ref<Controls::ToggleSwitch> targetSettings;
+            winrt::weak_ref<Controls::ToggleSwitch> targetNowPlaying;
             winrt::weak_ref<Controls::TextBox> hardwareBuffer;
             winrt::weak_ref<Controls::ComboBox> dacSettings;
             winrt::weak_ref<Controls::ComboBox> dacNowPlaying;
             winrt::weak_ref<Controls::TextBlock> nowPlayingFormat;
             {
                 std::lock_guard targetLock(g_uiTargetMutex);
-                target = g_toggle;
+                targetSettings = g_toggleSettings;
+                targetNowPlaying = g_toggleNowPlaying;
                 hardwareBuffer = g_hardwareBufferBox;
                 dacSettings = g_dacComboSettings;
                 dacNowPlaying = g_dacComboNowPlaying;
                 nowPlayingFormat = g_nowPlayingFormatText;
             }
-            if (auto control = target.get()) ApplyStatus(control);
+            if (auto control = targetSettings.get()) ApplyStatus(control);
+            if (auto control = targetNowPlaying.get()) ApplyStatus(control);
             if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
             if (auto combo = dacSettings.get()) ApplyEndpointsToCombo(combo);
             if (auto combo = dacNowPlaying.get()) ApplyEndpointsToCombo(combo);
@@ -949,7 +992,8 @@ void RememberHardwareBufferBox(const Controls::TextBox& input) {
 }
 
 void ScheduleStatusRefresh() {
-    winrt::weak_ref<Controls::ToggleSwitch> toggle;
+    winrt::weak_ref<Controls::ToggleSwitch> toggleSettings;
+    winrt::weak_ref<Controls::ToggleSwitch> toggleNowPlaying;
     winrt::weak_ref<Controls::TextBox> hardwareBuffer;
     winrt::weak_ref<Controls::ComboBox> dacSettings;
     winrt::weak_ref<Controls::ComboBox> dacNowPlaying;
@@ -957,7 +1001,8 @@ void ScheduleStatusRefresh() {
     Microsoft::UI::Dispatching::DispatcherQueue dispatcher{nullptr};
     {
         std::lock_guard lock(g_uiTargetMutex);
-        toggle = g_toggle;
+        toggleSettings = g_toggleSettings;
+        toggleNowPlaying = g_toggleNowPlaying;
         hardwareBuffer = g_hardwareBufferBox;
         dacSettings = g_dacComboSettings;
         dacNowPlaying = g_dacComboNowPlaying;
@@ -965,8 +1010,9 @@ void ScheduleStatusRefresh() {
         dispatcher = g_dispatcher;
     }
     if (dispatcher) {
-        dispatcher.TryEnqueue([toggle, hardwareBuffer, dacSettings, dacNowPlaying, nowPlayingFormat] {
-            if (auto control = toggle.get()) ApplyStatus(control);
+        dispatcher.TryEnqueue([toggleSettings, toggleNowPlaying, hardwareBuffer, dacSettings, dacNowPlaying, nowPlayingFormat] {
+            if (auto control = toggleSettings.get()) ApplyStatus(control);
+            if (auto control = toggleNowPlaying.get()) ApplyStatus(control);
             if (auto input = hardwareBuffer.get()) ApplyHardwareBufferStatus(input);
             if (auto combo = dacSettings.get()) ApplyEndpointsToCombo(combo);
             if (auto combo = dacNowPlaying.get()) ApplyEndpointsToCombo(combo);
@@ -1024,6 +1070,10 @@ void AttachNowPlayingDacSelector(const Xaml::DependencyObject& content, const Xa
             RememberNowPlayingFormatText(existingText);
             ApplyNowPlayingFormat(existingText);
         }
+        if (auto existingToggle = FindByName(content, L"AMExclusiveNowPlayingToggle").try_as<Controls::ToggleSwitch>()) {
+            RememberToggle(existingToggle, true);
+            ApplyStatus(existingToggle);
+        }
         return;
     }
 
@@ -1079,13 +1129,52 @@ void AttachNowPlayingDacSelector(const Xaml::DependencyObject& content, const Xa
 
     if (!anchorPanel) return;
 
+    Controls::TextBlock nowPlayingToggleLabel;
+    nowPlayingToggleLabel.Name(L"AMExclusiveNowPlayingToggleLabel");
+    nowPlayingToggleLabel.Text(Localized(L"独占", L"Exclusive"));
+    nowPlayingToggleLabel.FontSize(11.0);
+    nowPlayingToggleLabel.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    nowPlayingToggleLabel.Margin(Xaml::Thickness{6, 0, 2, 0});
+    if (auto secondaryBrush = ThemeBrush(L"TextFillColorSecondaryBrush")) {
+        nowPlayingToggleLabel.Foreground(secondaryBrush);
+    }
+    Controls::ToolTipService::SetToolTip(
+        nowPlayingToggleLabel,
+        box_value(hstring(Localized(L"WASAPI 独占输出开关",
+                                    L"WASAPI Exclusive output toggle"))));
+
+    Controls::ToggleSwitch nowPlayingToggle;
+    nowPlayingToggle.Name(L"AMExclusiveNowPlayingToggle");
+    nowPlayingToggle.OnContent(nullptr);
+    nowPlayingToggle.OffContent(nullptr);
+    nowPlayingToggle.Header(nullptr);
+    nowPlayingToggle.MinWidth(0.0);
+    nowPlayingToggle.Width(44.0);
+    nowPlayingToggle.Height(24.0);
+    nowPlayingToggle.VerticalAlignment(Xaml::VerticalAlignment::Center);
+    nowPlayingToggle.Margin(Xaml::Thickness{0, 0, 4, 0});
+    Automation::AutomationProperties::SetName(
+        nowPlayingToggle, Localized(L"独占模式", L"Exclusive mode"));
+    Controls::ToolTipService::SetToolTip(
+        nowPlayingToggle,
+        box_value(hstring(Localized(L"WASAPI 独占输出开关",
+                                    L"WASAPI Exclusive output toggle"))));
+
+    nowPlayingToggleLabel.Tapped([nowPlayingToggle](auto&&, auto&&) {
+        if (nowPlayingToggle.IsEnabled()) {
+            nowPlayingToggle.IsOn(!nowPlayingToggle.IsOn());
+        }
+    });
+
+    WireExclusiveToggle(nowPlayingToggle);
+
     Controls::ComboBox nowPlayingCombo;
     nowPlayingCombo.Name(L"AMExclusiveNowPlayingDacCombo");
     nowPlayingCombo.Width(130.0);
     nowPlayingCombo.Height(28.0);
     nowPlayingCombo.FontSize(11.0);
     nowPlayingCombo.VerticalAlignment(Xaml::VerticalAlignment::Center);
-    nowPlayingCombo.Margin(Xaml::Thickness{6, 0, 4, 0});
+    nowPlayingCombo.Margin(Xaml::Thickness{2, 0, 4, 0});
     Automation::AutomationProperties::SetName(
         nowPlayingCombo, Localized(L"输出设备", L"Output device"));
     Automation::AutomationProperties::SetHelpText(
@@ -1109,17 +1198,23 @@ void AttachNowPlayingDacSelector(const Xaml::DependencyObject& content, const Xa
 
     WireEndpointCombo(nowPlayingCombo);
     if (auto stack = anchorPanel.try_as<Controls::StackPanel>()) {
+        stack.Children().Append(nowPlayingToggleLabel);
+        stack.Children().Append(nowPlayingToggle);
         stack.Children().Append(nowPlayingCombo);
         stack.Children().Append(nowPlayingFormatText);
     } else {
+        anchorPanel.Children().Append(nowPlayingToggleLabel);
+        anchorPanel.Children().Append(nowPlayingToggle);
         anchorPanel.Children().Append(nowPlayingCombo);
         anchorPanel.Children().Append(nowPlayingFormatText);
     }
+    RememberToggle(nowPlayingToggle, true);
     RememberEndpointCombo(nowPlayingCombo, true);
     RememberNowPlayingFormatText(nowPlayingFormatText);
+    ApplyStatus(nowPlayingToggle);
     ApplyEndpointsToCombo(nowPlayingCombo);
     ApplyNowPlayingFormat(nowPlayingFormatText);
-    Log(L"Now playing DAC selector and format display attached to transport panel");
+    Log(L"Now playing Exclusive toggle, DAC selector and format display attached to transport panel");
 }
 
 void AttachTransportObservers() {
@@ -1384,42 +1479,7 @@ void AttachOrRefreshToggle() {
             toggle,
             Localized(L"尝试在当前默认播放设备上启用 WASAPI 独占输出",
                       L"Try to use WASAPI exclusive output on the current default playback device"));
-        toggle.Toggled([](winrt::Windows::Foundation::IInspectable const& sender,
-                          Xaml::RoutedEventArgs const&) {
-            if (g_suppressToggle.load()) return;
-            auto control = sender.as<Controls::ToggleSwitch>();
-            const bool enabled = control.IsOn();
-            int marker = g_programmaticToggleValue.load();
-            if (marker == (enabled ? 1 : 0) &&
-                g_programmaticToggleValue.compare_exchange_strong(marker, -1)) {
-                Log(std::wstring(L"ignored delayed programmatic toggle event enabled=") +
-                    (enabled ? L"1" : L"0"));
-                return;
-            }
-            // WinUI may deliver Toggled after ApplyStatus has returned, so a short-lived
-            // suppression flag alone cannot distinguish a delayed backend-driven update
-            // from an actual click.  A real click always differs from the last broker
-            // intent; an equal value is merely the status echo and must not be sent back.
-            if (enabled == (StatusSnapshot().enabledIntent != 0)) {
-                Log(std::wstring(L"ignored broker-driven toggle event enabled=") +
-                    (enabled ? L"1" : L"0"));
-                return;
-            }
-            Log(std::wstring(L"user toggled exclusive mode enabled=") +
-                (enabled ? L"1" : L"0"));
-            control.IsEnabled(false);
-            if (!SendEnabled(enabled)) {
-                g_suppressToggle.store(true);
-                g_programmaticToggleValue.store(0);
-                control.IsOn(false);
-                control.IsEnabled(true);
-                if (auto statusText = FindStatusText(control)) {
-                    statusText.Text(Localized(L"独占音频组件无法启动",
-                                              L"The exclusive audio component could not start"));
-                }
-                g_suppressToggle.store(false);
-            }
-        });
+        WireExclusiveToggle(toggle);
         Controls::TextBlock title;
         title.Text(Localized(L"独占模式", L"Exclusive mode"));
         Controls::TextBlock description;
