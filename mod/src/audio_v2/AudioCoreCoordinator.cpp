@@ -17,7 +17,13 @@ HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) n
     // coordinator. Keep Disable() as the safety boundary, but make the no-op
     // case cheap so one Apple graph transition cannot multiply Stop/Close
     // work through Runtime -> Coordinator -> Sink layers.
-    Disable();
+    const bool canKeepSink = sink_.State() == WasapiSinkState::Running &&
+        config_.sink.endpointId == config.sink.endpointId &&
+        config_.sink.format.sampleRate == config.sink.format.sampleRate &&
+        config_.sink.format.channels == config.sink.format.channels &&
+        config_.sink.format.validBits == config.sink.format.validBits &&
+        config_.sink.format.containerBits == config.sink.format.containerBits;
+    Disable(canKeepSink);
     if (!IsValidFormat(config.sink.format) || config.queueCapacity == 0 ||
         config.mediaGeneration == 0) {
         return E_INVALIDARG;
@@ -60,7 +66,7 @@ HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) n
     return S_OK;
 }
 
-void AudioCoreCoordinator::Disable() noexcept {
+void AudioCoreCoordinator::Disable(bool keepSinkRunning) noexcept {
     if (!gate_.UiEnabled() && !queue_ && !source_ && !sourceReadyEvent_ &&
         sink_.State() != WasapiSinkState::Running) {
         return;
@@ -72,7 +78,12 @@ void AudioCoreCoordinator::Disable() noexcept {
     outputGate_.Reset();
     gate_.SetUiEnabled(false);
     if (sourceReadyEvent_) SetEvent(sourceReadyEvent_);
-    sink_.Stop();
+    if (keepSinkRunning && sink_.State() == WasapiSinkState::Running) {
+        sink_.DetachSource();
+        Sleep(15);
+    } else {
+        sink_.Stop();
+    }
     // Keep sink_ open so that the existing WASAPI exclusive hardware session
     // can be reused seamlessly if the next generation has the same format & endpoint.
     source_.reset();

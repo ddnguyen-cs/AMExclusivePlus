@@ -108,6 +108,7 @@ public:
 
     HRESULT Open(const WasapiSinkConfig& config) noexcept;
     HRESULT Start(IIntegerPcmSource& source) noexcept;
+    void DetachSource() noexcept { source_.store(nullptr, std::memory_order_release); }
     void Stop() noexcept;
     void Close() noexcept;
 
@@ -157,7 +158,7 @@ private:
     std::atomic<bool> waitingForSource_{};
     std::atomic<bool> resumeBlocked_{};
     std::atomic<bool> endOfStreamSubmitted_{};
-    IIntegerPcmSource* source_{};
+    std::atomic<IIntegerPcmSource*> source_{};
     std::uint32_t bufferFrames_{};
     bool comInitialized_{};
 

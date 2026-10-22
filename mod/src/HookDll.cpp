@@ -3245,11 +3245,16 @@ void V2OnNativeRenderData(void* context, void* client, const float* samples,
         client, samples, frames, silent);
 }
 
+bool V2UiEnabled(void* context) noexcept {
+    return context && static_cast<ammod::audio_v2::AudioCoreRuntime*>(context)->UiEnabled();
+}
+
 ammod::audio_v2::NativeAudioCallbacks V2NativeCallbacks() noexcept {
     return {&g_audioCoreRuntime, &V2OnNativeInitialize, &V2OnNativeStart,
             &V2BeforeNativeStop, &V2OnNativeStop, &V2OnNativeReset, &V2ShouldSuppress,
             &V2OnNativeGetBuffer, &V2OnNativeReleaseBuffer, &V2OnNativeMethod,
-            &V2OnNativeService, &V2NativePumpPeriodMs, &V2OnNativeRenderData};
+            &V2OnNativeService, &V2NativePumpPeriodMs, &V2OnNativeRenderData,
+            &V2UiEnabled};
 }
 
 void HookV2Device(IMMDevice* device);

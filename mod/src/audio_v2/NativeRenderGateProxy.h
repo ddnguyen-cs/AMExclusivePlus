@@ -55,6 +55,7 @@ struct NativeAudioCallbacks final {
     std::uint32_t (*pumpPeriodMs)(void* context) noexcept{};
     void (*onRenderData)(void* context, void* client, const float* samples,
                          UINT32 frames, bool silent) noexcept{};
+    bool (*uiEnabled)(void* context) noexcept{};
 };
 
 class NativeRenderGateProxy;
@@ -156,7 +157,8 @@ public:
     HRESULT STDMETHODCALLTYPE ReleaseBuffer(UINT32 frames, DWORD flags) override {
         DWORD effectiveFlags = flags;
         bool shadow = false;
-        const bool suppress = ShouldSuppress();
+        const bool suppress = ShouldSuppress() ||
+            (callbacks_.uiEnabled && callbacks_.uiEnabled(callbacks_.context));
         HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
         {
             std::lock_guard lock(innerMutex_);
@@ -172,6 +174,7 @@ public:
                     // cutover.  Do not replace the call with a fake ReleaseBuffer.
                     const auto byteCount = static_cast<std::size_t>(frames) * bytesPerFrame_;
                     std::memset(acquiredData_, 0, byteCount);
+                    effectiveFlags |= AUDCLNT_BUFFERFLAGS_SILENT;
                 }
                 result = inner_->ReleaseBuffer(frames, effectiveFlags);
                 if (nativeBufferInFlight_ && acquiredFrames_ == frames) {

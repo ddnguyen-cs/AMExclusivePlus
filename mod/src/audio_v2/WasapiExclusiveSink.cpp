@@ -42,9 +42,9 @@ WasapiExclusiveSink::~WasapiExclusiveSink() {
 
 HRESULT WasapiExclusiveSink::Open(const WasapiSinkConfig& config) noexcept {
     bool canReuse = false;
-    if (state_.load(std::memory_order_acquire) == WasapiSinkState::Open &&
+    const auto currentState = state_.load(std::memory_order_acquire);
+    if ((currentState == WasapiSinkState::Open || currentState == WasapiSinkState::Running) &&
         client_ != nullptr && render_ != nullptr && device_ != nullptr &&
-        !renderThread_ &&
         config_.endpointId == config.endpointId &&
         config_.format.sampleRate == config.format.sampleRate &&
         config_.format.channels == config.format.channels &&
@@ -79,7 +79,7 @@ HRESULT WasapiExclusiveSink::Open(const WasapiSinkConfig& config) noexcept {
         waitingForSource_.store(false, std::memory_order_release);
         resumeBlocked_.store(false, std::memory_order_release);
         endOfStreamSubmitted_.store(false, std::memory_order_release);
-        if (client_) {
+        if (currentState == WasapiSinkState::Open && client_) {
             const HRESULT resetHr = client_->Reset();
             if (FAILED(resetHr) && resetHr != AUDCLNT_E_NOT_INITIALIZED) {
                 canReuse = false;
@@ -313,7 +313,14 @@ HRESULT WasapiExclusiveSink::Start(IIntegerPcmSource& source) noexcept {
         NotifyLifecycle(WasapiSinkLifecycleEvent::StartExit, result);
         return result;
     };
-    if (state_.load(std::memory_order_acquire) != WasapiSinkState::Open || !client_ || !render_) {
+    const auto currentState = state_.load(std::memory_order_acquire);
+    if (currentState == WasapiSinkState::Running && renderThread_ && client_ && render_) {
+        source_.store(&source, std::memory_order_release);
+        stopRequested_.store(false, std::memory_order_release);
+        endOfStreamSubmitted_.store(false, std::memory_order_release);
+        return finish(S_OK);
+    }
+    if (currentState != WasapiSinkState::Open || !client_ || !render_) {
         return finish(E_UNEXPECTED);
     }
     if (!shutdownEvent_ || !ResetEvent(shutdownEvent_)) {
@@ -322,7 +329,7 @@ HRESULT WasapiExclusiveSink::Start(IIntegerPcmSource& source) noexcept {
         state_.store(WasapiSinkState::Faulted, std::memory_order_release);
         return finish(error);
     }
-    source_ = &source;
+    source_.store(&source, std::memory_order_release);
     stopRequested_.store(false, std::memory_order_release);
     waitingForSource_.store(false, std::memory_order_release);
     endOfStreamSubmitted_.store(false, std::memory_order_release);
@@ -331,7 +338,7 @@ HRESULT WasapiExclusiveSink::Start(IIntegerPcmSource& source) noexcept {
     // render deterministic and makes short reads observable before cutover.
     const HRESULT prime = RenderOneBuffer();
     if (FAILED(prime)) {
-        source_ = nullptr;
+        source_.store(nullptr, std::memory_order_release);
         state_.store(WasapiSinkState::Faulted, std::memory_order_release);
         return finish(prime);
     }
@@ -340,7 +347,7 @@ HRESULT WasapiExclusiveSink::Start(IIntegerPcmSource& source) noexcept {
     if (!renderThread_) {
         const auto hr = HRESULT_FROM_WIN32(GetLastError());
         RecordError(hr);
-        source_ = nullptr;
+        source_.store(nullptr, std::memory_order_release);
         state_.store(WasapiSinkState::Faulted, std::memory_order_release);
         return finish(hr);
     }
@@ -353,7 +360,7 @@ HRESULT WasapiExclusiveSink::Start(IIntegerPcmSource& source) noexcept {
         WaitForSingleObject(renderThread_, INFINITE);
         CloseHandle(renderThread_);
         renderThread_ = nullptr;
-        source_ = nullptr;
+        source_.store(nullptr, std::memory_order_release);
         state_.store(WasapiSinkState::Faulted, std::memory_order_release);
         return finish(hr);
     }
@@ -362,26 +369,17 @@ HRESULT WasapiExclusiveSink::Start(IIntegerPcmSource& source) noexcept {
 }
 
 HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
-    if (!source_) return E_UNEXPECTED;
-    if (!source_->CanProvide(bufferFrames_)) {
-        // Publish the waiting state before the second availability check. A
-        // producer that races the first check will either be observed here or
-        // see waitingForSource_ and signal sourceReadyEvent_, so no wakeup is
-        // lost while healthy playback avoids producer-cadence event traffic.
-        waitingForSource_.store(true, std::memory_order_release);
-        if (!source_->CanProvide(bufferFrames_)) {
-            sourceWaits_.fetch_add(1, std::memory_order_relaxed);
-            if (client_) {
-                const HRESULT stop = client_->Stop();
-                if (FAILED(stop) && stop != AUDCLNT_E_NOT_INITIALIZED) {
-                    RecordError(stop);
-                    state_.store(WasapiSinkState::Faulted, std::memory_order_release);
-                    return stop;
-                }
-            }
-            return kAudioSourceWouldBlock;
+    IIntegerPcmSource* src = source_.load(std::memory_order_acquire);
+    if (!src || !src->CanProvide(bufferFrames_)) {
+        sourceWaits_.fetch_add(1, std::memory_order_relaxed);
+        BYTE* data = nullptr;
+        HRESULT hr = render_->GetBuffer(bufferFrames_, &data);
+        if (SUCCEEDED(hr) && data) {
+            std::memset(data, 0, static_cast<std::size_t>(bufferFrames_) * waveFormat_.Format.nBlockAlign);
+            (void)render_->ReleaseBuffer(bufferFrames_, AUDCLNT_BUFFERFLAGS_SILENT);
+            controlledSilenceFrames_.fetch_add(bufferFrames_, std::memory_order_relaxed);
         }
-        waitingForSource_.store(false, std::memory_order_release);
+        return S_OK;
     }
     BYTE* data = nullptr;
     HRESULT hr = render_->GetBuffer(bufferFrames_, &data);
@@ -395,7 +393,7 @@ HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
     bool endOfStream = false;
     auto* canonical = config_.format.containerBits == 32
         ? reinterpret_cast<std::int32_t*>(data) : canonicalBuffer_.data();
-    hr = source_->Fill(canonical, bufferFrames_, written, endOfStream);
+    hr = src->Fill(canonical, bufferFrames_, written, endOfStream);
     if (SUCCEEDED(hr) && written <= bufferFrames_ && config_.format.containerBits != 32) {
         const auto sampleCount = static_cast<std::size_t>(written) * config_.format.channels;
         if (!PackCanonicalPcm32(canonical, data, sampleCount, config_.format.containerBits)) {
@@ -467,48 +465,11 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
     if (mmcss) (void)AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_CRITICAL);
 
     if (SUCCEEDED(apartment) || apartment == RPC_E_CHANGED_MODE) {
-        HANDLE handles[3] = {shutdownEvent_, audioEvent_, config_.sourceReadyEvent};
-        const DWORD handleCount = config_.sourceReadyEvent ? 3u : 2u;
+        HANDLE handles[2] = {shutdownEvent_, audioEvent_};
         while (!stopRequested_.load(std::memory_order_acquire)) {
-            const DWORD waitTimeout = waitingForSource_.load(std::memory_order_acquire)
-                ? 50u
-                : (config_.sourceReadyEvent ? INFINITE : 20u);
             const DWORD wait = WaitForMultipleObjects(
-                handleCount, handles, FALSE, waitTimeout);
+                2, handles, FALSE, 50u);
             if (wait == WAIT_OBJECT_0) break;
-            if (waitingForSource_.load(std::memory_order_acquire)) {
-                if (resumeBlocked_.load(std::memory_order_acquire)) continue;
-                const bool sourceSignal = config_.sourceReadyEvent
-                    ? wait == WAIT_OBJECT_0 + 2
-                    : wait == WAIT_TIMEOUT;
-                // A stopped exclusive client no longer produces audio events.
-                // Wait for the producer's P0 notification, or poll when a
-                // caller did not provide a notification handle.
-                if (!sourceSignal) continue;
-                if (!source_ || !source_->CanProvide(bufferFrames_)) continue;
-
-                // Fill the stopped client before restarting it. This preserves
-                // the exact source stream across a network wait and avoids a
-                // restart into an empty endpoint buffer.
-                waitingForSource_.store(false, std::memory_order_release);
-                const HRESULT fill = RenderOneBuffer();
-                if (fill == kAudioSourceWouldBlock) continue;
-                if (FAILED(fill)) {
-                    threadFailure = fill;
-                    break;
-                }
-                if (stopRequested_.load(std::memory_order_acquire)) break;
-                const HRESULT resume = client_ ? client_->Start() : E_UNEXPECTED;
-                if (FAILED(resume)) {
-                    threadFailure = resume;
-                    break;
-                }
-                continue;
-            }
-            // A producer notification may race with a normal audio-event
-            // wake while the sink is already running. It is only meaningful
-            // in the waiting state; consume and ignore it here.
-            if (config_.sourceReadyEvent && wait == WAIT_OBJECT_0 + 2) continue;
             if (wait == WAIT_TIMEOUT) continue;
             if (wait != WAIT_OBJECT_0 + 1) {
                 threadFailure = wait == WAIT_FAILED
@@ -516,7 +477,6 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
                 break;
             }
             const HRESULT render = RenderOneBuffer();
-            if (render == kAudioSourceWouldBlock) continue;
             if (FAILED(render)) {
                 threadFailure = render;
                 break;
@@ -556,7 +516,7 @@ void WasapiExclusiveSink::Stop() noexcept {
         CloseHandle(renderThread_);
         renderThread_ = nullptr;
     }
-    source_ = nullptr;
+    source_.store(nullptr, std::memory_order_release);
     waitingForSource_.store(false, std::memory_order_release);
     resumeBlocked_.store(false, std::memory_order_release);
     if (client_ && current != WasapiSinkState::Faulted) {
@@ -581,7 +541,7 @@ void WasapiExclusiveSink::Close() noexcept {
     NotifyLifecycle(WasapiSinkLifecycleEvent::CloseEnter, S_OK);
     Stop();
     ReleaseInterfaces();
-    source_ = nullptr;
+    source_.store(nullptr, std::memory_order_release);
     state_.store(WasapiSinkState::Closed, std::memory_order_release);
     if (comInitialized_) {
         CoUninitialize();

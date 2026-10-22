@@ -43,7 +43,7 @@ public:
     AudioCoreCoordinator& operator=(const AudioCoreCoordinator&) = delete;
 
     HRESULT Enable(const AudioCoreCoordinatorConfig& config) noexcept;
-    void Disable() noexcept;
+    void Disable(bool keepSinkRunning = false) noexcept;
 
     bool PushP0Interleaved(std::uint64_t firstFrame,
                            const float* interleaved,

@@ -744,7 +744,7 @@ void AudioCoreRuntime::OnAudioUnitUninitialized(void* unit) noexcept {
     graphPaused_ = false;
     graphControlPending_ = false;
     if (!endOfStreamDrainPending_ && !streamingProducerDrainPending_) {
-        RetireCaptureLocked(false);
+        RetireCaptureLocked(seekFence_);
     }
     graphUnit_ = nullptr;
     graphOutputUnit_ = nullptr;
@@ -1573,7 +1573,7 @@ void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph) noexcept {
             }
         }
         while (callbackDepth_.load(std::memory_order_acquire) != 0) SwitchToThread();
-        coordinator_.Disable();
+        coordinator_.Disable(keepGraph);
         graphBound_ = false;
         boundMediaGeneration_.store(0, std::memory_order_release);
         nativePumpBufferedFrames_.store(0, std::memory_order_release);
