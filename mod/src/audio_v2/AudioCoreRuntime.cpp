@@ -591,6 +591,12 @@ bool AudioCoreRuntime::TryBindLocalSuccessor(void* converter) noexcept {
         !graphUnit_ || !graphStarted_ || graphBound_) {
         return false;
     }
+    if (graphRate_ != 0 && graphRate_ != snapshot.registration.outputFormat.sampleRate) {
+        return false;
+    }
+    if (graphConverter_ != nullptr && graphConverter_ != converter) {
+        return false;
+    }
     graphConverter_ = converter;
     graphRate_ = snapshot.registration.outputFormat.sampleRate;
     graphChannels_ = snapshot.registration.outputFormat.channels;
@@ -660,14 +666,15 @@ void AudioCoreRuntime::OnAudioUnitStarted(void* unit) noexcept {
     } else if (graphUnit_ == unit) {
         graphStarted_ = true;
         TryBindGraphLocked();
-    } else if (graphBound_ && graphUnit_ && unit) {
+    } else if (graphUnit_ && unit) {
         // Apple starts the hardware-output parent AudioUnit (for example
         // auou/7820) after initializing the child graph AudioUnit that owns
         // the P0 converter (7823). The child identity is already fixed by
-        // the stream-format commit and bound converter, so this first parent
+        // the stream-format commit or pending converter, so this parent
         // start is the graph-start edge for activation purposes.
         graphStarted_ = true;
         graphOutputUnit_ = unit;
+        TryBindGraphLocked();
     }
     if (!userPauseIntent_) TryResumePausedSinkLocked();
     Wake();
@@ -1174,7 +1181,9 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
                     ConverterRegistrationSnapshot snapshot{};
                     if (registry_.Snapshot(pendingLocal, snapshot) &&
                         snapshot.registration.encodedFormat == kAppleLinearPcm &&
-                        graphUnit_ && graphStarted_) {
+                        graphUnit_ && graphStarted_ &&
+                        (graphRate_ == 0 || graphRate_ == snapshot.registration.outputFormat.sampleRate) &&
+                        (!graphConverter_ || graphConverter_ == pendingLocal)) {
                         graphConverter_ = pendingLocal;
                         graphRate_ = snapshot.registration.outputFormat.sampleRate;
                         graphChannels_ = snapshot.registration.outputFormat.channels;
@@ -1183,8 +1192,10 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
                         TryBindGraphLocked();
                     } else if (registry_.Snapshot(pendingLocal, snapshot) &&
                                snapshot.registration.encodedFormat == kAppleLinearPcm) {
-                        pendingLocalRebindConverter_.store(pendingLocal,
-                                                           std::memory_order_release);
+                        if (graphRate_ == 0 || graphRate_ == snapshot.registration.outputFormat.sampleRate) {
+                            pendingLocalRebindConverter_.store(pendingLocal,
+                                                               std::memory_order_release);
+                        }
                     }
                 }
             }
@@ -1545,7 +1556,11 @@ void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph) noexcept {
         const auto converter = boundConverter_.exchange(nullptr, std::memory_order_acq_rel);
         if (converter) {
             tap_.Retire(converter);
-            registry_.Unbind(converter);
+            if (converter == kNativeAacPseudoConverter) {
+                registry_.Retire(converter);
+            } else {
+                registry_.Unbind(converter);
+            }
         }
         while (callbackDepth_.load(std::memory_order_acquire) != 0) SwitchToThread();
         coordinator_.Disable();
@@ -1557,7 +1572,10 @@ void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph) noexcept {
         nativeFrameCursor_ = 0;
         nextTelemetryTick_ = 0;
     }
-    if (!keepGraph) {
+    if (!keepGraph || graphConverter_ == kNativeAacPseudoConverter) {
+        if (graphConverter_ == kNativeAacPseudoConverter) {
+            registry_.Retire(kNativeAacPseudoConverter);
+        }
         graphUnit_ = nullptr;
         graphConverter_ = nullptr;
         graphRate_ = 0;

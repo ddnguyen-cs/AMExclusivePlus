@@ -138,7 +138,8 @@ public:
         Slot* best{};
         std::uint64_t bestObservation = 0;
         for (auto& slot : slots_) {
-            if (slot.key.load(std::memory_order_acquire) <= kReservedKey ||
+            const auto key = slot.key.load(std::memory_order_acquire);
+            if (key <= kReservedKey || key == kNativeAacPseudoConverterKey ||
                 slot.rate.load(std::memory_order_relaxed) != sampleRate ||
                 slot.channels.load(std::memory_order_relaxed) != channels) {
                 continue;
@@ -156,7 +157,7 @@ public:
         best->sourceValidBits.store(sourceBitDepth, std::memory_order_release);
         if (sourceBitDepth == 32) best->validBits.store(32, std::memory_order_release);
         const auto key = best->key.load(std::memory_order_acquire);
-        if (key <= kReservedKey) return false;
+        if (key <= kReservedKey || key == kNativeAacPseudoConverterKey) return false;
         matchedConverter = reinterpret_cast<void*>(key);
         return true;
     }
@@ -187,7 +188,8 @@ public:
         converter = nullptr;
         std::uint64_t bestObservation = 0;
         const auto matches = [&](const Slot& slot, bool exactObservation) {
-            if (slot.key.load(std::memory_order_acquire) <= kReservedKey ||
+            const auto key = slot.key.load(std::memory_order_acquire);
+            if (key <= kReservedKey || key == kNativeAacPseudoConverterKey ||
                 slot.rate.load(std::memory_order_relaxed) != sampleRate ||
                 slot.channels.load(std::memory_order_relaxed) != channels ||
                 slot.sourceBitDepth.load(std::memory_order_relaxed) != sourceBitDepth ||
@@ -210,7 +212,7 @@ public:
             for (const auto& slot : slots_) {
                 if (!matches(slot, true)) continue;
                 const auto key = slot.key.load(std::memory_order_acquire);
-                if (key <= kReservedKey) continue;
+                if (key <= kReservedKey || key == kNativeAacPseudoConverterKey) continue;
                 converter = reinterpret_cast<void*>(key);
                 return true;
             }
@@ -220,7 +222,7 @@ public:
         for (const auto& slot : slots_) {
             if (!matches(slot, false)) continue;
             const auto key = slot.key.load(std::memory_order_acquire);
-            if (key <= kReservedKey) continue;
+            if (key <= kReservedKey || key == kNativeAacPseudoConverterKey) continue;
             const auto observed = slot.observationId.load(std::memory_order_relaxed);
             if (observed < bestObservation) continue;
             bestObservation = observed;
@@ -242,7 +244,8 @@ public:
         const Slot* best{};
         std::uint64_t bestObservation = 0;
         for (const auto& slot : slots_) {
-            if (slot.key.load(std::memory_order_acquire) <= kReservedKey ||
+            const auto key = slot.key.load(std::memory_order_acquire);
+            if (key <= kReservedKey || key == kNativeAacPseudoConverterKey ||
                 slot.rate.load(std::memory_order_relaxed) != sampleRate ||
                 slot.channels.load(std::memory_order_relaxed) != channels) {
                 continue;
@@ -264,7 +267,7 @@ public:
         }
         if (!best) return false;
         const auto key = best->key.load(std::memory_order_acquire);
-        if (key <= kReservedKey) return false;
+        if (key <= kReservedKey || key == kNativeAacPseudoConverterKey) return false;
         converter = reinterpret_cast<void*>(key);
         sourceBitDepth = best->sourceBitDepth.load(std::memory_order_relaxed);
         return sourceBitDepth == 0 ||
@@ -396,6 +399,7 @@ private:
     };
 
     static constexpr std::uintptr_t kReservedKey = 1;
+    static constexpr std::uintptr_t kNativeAacPseudoConverterKey = 0xAA00CC00u;
 
     Slot* FindSlot(void* converter) noexcept {
         const auto key = reinterpret_cast<std::uintptr_t>(converter);
