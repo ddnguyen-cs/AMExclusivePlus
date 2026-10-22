@@ -53,6 +53,8 @@ struct NativeAudioCallbacks final {
     void (*onService)(void* context, void* client, REFIID serviceIid,
                       HRESULT result) noexcept{};
     std::uint32_t (*pumpPeriodMs)(void* context) noexcept{};
+    void (*onRenderData)(void* context, void* client, const float* samples,
+                         UINT32 frames, bool silent) noexcept{};
 };
 
 class NativeRenderGateProxy;
@@ -176,6 +178,14 @@ public:
                     nativeBufferInFlight_ = false;
                     drainCv_.notify_all();
                 }
+            }
+        }
+        if (shadow && acquiredData_ && acquiredFrames_ == frames) {
+            const bool silent = (effectiveFlags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+            if (callbacks_.onRenderData) {
+                callbacks_.onRenderData(callbacks_.context, clientIdentity_,
+                                        reinterpret_cast<const float*>(acquiredData_),
+                                        frames, silent);
             }
         }
         if (callbacks_.onReleaseBuffer) {

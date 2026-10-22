@@ -607,15 +607,18 @@ HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::Reset() {
 
 HRESULT STDMETHODCALLTYPE NativeAudioClientProxy::SetEventHandle(HANDLE eventHandle) {
     HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
+    bool shouldStartPump = false;
     {
         std::lock_guard lock(innerMutex_);
         if (pumpMode_) {
             pumpEvent_.store(eventHandle, std::memory_order_release);
             result = eventHandle ? S_OK : E_INVALIDARG;
+            shouldStartPump = SUCCEEDED(result) && pumpStarted_;
         } else if (inner_) {
             result = inner_->SetEventHandle(eventHandle);
         }
     }
+    if (shouldStartPump) StartPumpThread();
     Trace(L"SetEventHandle", result);
     return result;
 }

@@ -646,7 +646,10 @@ void AudioCoreRuntime::OnAudioUnitStarted(void* unit) noexcept {
     graphPaused_ = false;
     graphControlPending_ = false;
     coordinator_.SetSinkResumeBlocked(false);
-    if (graphUnit_ == unit) {
+    if (!graphUnit_) {
+        graphUnit_ = unit;
+        graphStarted_ = true;
+    } else if (graphUnit_ == unit) {
         graphStarted_ = true;
         TryBindGraphLocked();
     } else if (graphBound_ && graphUnit_ && unit) {
@@ -729,7 +732,7 @@ void AudioCoreRuntime::OnAudioUnitUninitialized(void* unit) noexcept {
 
 void AudioCoreRuntime::OnNativeClientInitialized(void* client, const wchar_t* endpoint,
                                                   AUDCLNT_SHAREMODE, DWORD,
-                                                  const WAVEFORMATEX*, HRESULT result) noexcept {
+                                                  const WAVEFORMATEX* format, HRESULT result) noexcept {
     if (!UiEnabled() || FAILED(result) || !client) return;
     std::lock_guard lock(controlMutex_);
     ExtendSeekQuietPeriodLocked();
@@ -737,6 +740,10 @@ void AudioCoreRuntime::OnNativeClientInitialized(void* client, const wchar_t* en
     nativeInitialized_ = true;
     nativeStarted_ = false;
     nativeEndpoint_ = endpoint ? endpoint : L"";
+    if (format && format->nSamplesPerSec >= 8000 && format->nSamplesPerSec <= 768000) {
+        nativeClientRate_ = format->nSamplesPerSec;
+        nativeClientChannels_ = format->nChannels ? format->nChannels : 2u;
+    }
     Wake();
 }
 
@@ -747,6 +754,9 @@ void AudioCoreRuntime::OnNativeClientStarted(void* client, HRESULT result) noexc
     nativeClient_.store(client, std::memory_order_release);
     nativeInitialized_ = true;
     nativeStarted_ = true;
+    if (boundConverter_.load(std::memory_order_acquire) == kNativeAacPseudoConverter) {
+        graphStarted_ = true;
+    }
     TryBindGraphLocked();
     if (!userPauseIntent_) TryResumePausedSinkLocked();
     Wake();
@@ -799,6 +809,10 @@ void* AudioCoreRuntime::OnNativeClientStopped(void* client, HRESULT) noexcept {
     ExtendSeekQuietPeriodLocked();
     if (nativeClient_.load(std::memory_order_acquire) != client) return nullptr;
     nativeStarted_ = false;
+    if (boundConverter_.load(std::memory_order_acquire) == kNativeAacPseudoConverter) {
+        graphStarted_ = false;
+        coordinator_.PauseEndpoint();
+    }
     if (graphControlPending_ || graphPaused_ || userPauseIntent_) {
         // Stopping the Apple AudioUnit can synchronously stop its native
         // client as well. Keep the v2 generation alive until the matching
@@ -1516,6 +1530,7 @@ void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph) noexcept {
         nativePumpBufferedFrames_.store(0, std::memory_order_release);
         nativePumpSampleRate_.store(0, std::memory_order_release);
         requiredPrebufferFrames_ = 0;
+        nativeFrameCursor_ = 0;
         nextTelemetryTick_ = 0;
     }
     if (!keepGraph) {
@@ -1576,4 +1591,95 @@ std::uint32_t AudioCoreRuntime::PeriodFrames(std::uint32_t sampleRate) const noe
     return static_cast<std::uint32_t>(std::max<std::uint64_t>(1u, frames));
 }
 
+
+bool AudioCoreRuntime::BindNativeStream(std::uint32_t sampleRate, std::uint32_t channels) noexcept {
+    std::lock_guard lock(controlMutex_);
+    if (!UiEnabled() || sampleRate < 8000 || sampleRate > 768000 || channels != 2) return false;
+
+    void* const converter = kNativeAacPseudoConverter;
+
+    if (graphBound_ && boundConverter_.load(std::memory_order_acquire) == converter &&
+        graphRate_ == sampleRate && graphChannels_ == channels) {
+        return true;
+    }
+
+    if (graphBound_) RetireCaptureLocked(true);
+
+    const auto observationId = ++nextObservationId_;
+    const auto generation = ++nextMediaGeneration_;
+
+    const PcmFormat outputFormat{
+        sampleRate, static_cast<std::uint16_t>(channels),
+        24, 32, PcmEncoding::SignedInteger, true, 24};
+
+    ConverterRegistration registration{};
+    registration.converter = converter;
+    registration.outputFormat = outputFormat;
+    registration.sourceBitDepth = 24;
+    registration.encodedFormat = ammod::audio::kRawAac;
+    registration.observationId = observationId;
+    registration.mediaGeneration = generation;
+    registration.appleFormatFlags = kAppleFormatFlagIsFloat;
+    registration.appleBytesPerPacket = 8;
+    registration.appleFramesPerPacket = 1;
+    registration.appleBytesPerFrame = 8;
+    registration.appleBitsPerChannel = 32;
+    registration.appleChannelsPerFrame = channels;
+
+    registry_.Register(registration);
+
+    graphUnit_ = graphUnit_ ? graphUnit_ : converter;
+    graphConverter_ = converter;
+    graphRate_ = sampleRate;
+    graphChannels_ = channels;
+    graphSourceBits_ = 24;
+    graphObservationId_ = observationId;
+    graphStarted_ = true;
+    nativeStarted_ = true;
+    nativeInitialized_ = true;
+    nativeFrameCursor_ = 0;
+
+    TryBindGraphLocked();
+    return graphBound_;
+}
+
+void AudioCoreRuntime::OnNativeRenderData(void* client, const float* samples,
+                                          std::uint32_t frames, bool silent) noexcept {
+    if (!UiEnabled() || !client || frames == 0) return;
+
+    void* bound = boundConverter_.load(std::memory_order_acquire);
+    if (bound != nullptr && bound != kNativeAacPseudoConverter) {
+        // ALAC/Lossless converter is bound and actively rendering; do not intercept shadow output.
+        return;
+    }
+
+    const auto rate = nativeClientRate_ != 0 ? nativeClientRate_ : 44100u;
+    const auto channels = nativeClientChannels_ != 0 ? nativeClientChannels_ : 2u;
+
+    if (!graphBound_ || bound != kNativeAacPseudoConverter ||
+        graphRate_ != rate || graphChannels_ != channels) {
+        if (!BindNativeStream(rate, channels)) {
+            return;
+        }
+    }
+
+    if (!graphBound_ || coordinator_.Phase() == AudioCoreGatePhase::Off) return;
+
+    if (silent || !samples) {
+        static const float kSilence[4096]{};
+        std::uint32_t remaining = frames;
+        while (remaining > 0) {
+            const auto chunk = std::min<std::uint32_t>(remaining, 2048u);
+            coordinator_.PushP0Interleaved(nativeFrameCursor_, kSilence, chunk, false, false);
+            nativeFrameCursor_ += chunk;
+            remaining -= chunk;
+        }
+    } else {
+        coordinator_.PushP0Interleaved(nativeFrameCursor_, samples, frames, false, false);
+        nativeFrameCursor_ += frames;
+    }
+    Wake();
+}
+
 } // namespace ammod::audio_v2
+

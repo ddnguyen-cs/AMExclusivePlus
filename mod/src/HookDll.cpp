@@ -3124,7 +3124,7 @@ void V2OnNativeGetBuffer(void*, void* client, std::uint32_t frames,
                          HRESULT result, bool shadow) noexcept {
     const auto call = g_v2NativeGetBufferCalls.fetch_add(1, std::memory_order_relaxed) + 1;
     const bool trace = g_nativeTraceEnabled.load(std::memory_order_relaxed);
-    if (FAILED(result) || (!shadow && call <= 4) ||
+    if (FAILED(result) || (call <= 4) ||
         (trace && (call <= 12 || call % 256u == 0))) {
         Log(L"v2 native GetBuffer client=" +
             std::to_wstring(reinterpret_cast<std::uintptr_t>(client)) +
@@ -3138,7 +3138,7 @@ void V2OnNativeReleaseBuffer(void*, void* client, std::uint32_t frames,
                              HRESULT result, bool shadow) noexcept {
     const auto call = g_v2NativeReleaseBufferCalls.fetch_add(1, std::memory_order_relaxed) + 1;
     const bool trace = g_nativeTraceEnabled.load(std::memory_order_relaxed);
-    if (FAILED(result) || (!shadow && call <= 4) ||
+    if (FAILED(result) || (call <= 4) ||
         (trace && (call <= 12 || call % 256u == 0))) {
         Log(L"v2 native ReleaseBuffer client=" +
             std::to_wstring(reinterpret_cast<std::uintptr_t>(client)) +
@@ -3238,11 +3238,18 @@ HRESULT V2ResumeNativeGraphAfterFailedHandoff(void*, void* unit) noexcept {
     return result;
 }
 
+void V2OnNativeRenderData(void* context, void* client, const float* samples,
+                          UINT32 frames, bool silent) noexcept {
+    if (!context) return;
+    static_cast<ammod::audio_v2::AudioCoreRuntime*>(context)->OnNativeRenderData(
+        client, samples, frames, silent);
+}
+
 ammod::audio_v2::NativeAudioCallbacks V2NativeCallbacks() noexcept {
     return {&g_audioCoreRuntime, &V2OnNativeInitialize, &V2OnNativeStart,
             &V2BeforeNativeStop, &V2OnNativeStop, &V2OnNativeReset, &V2ShouldSuppress,
             &V2OnNativeGetBuffer, &V2OnNativeReleaseBuffer, &V2OnNativeMethod,
-            &V2OnNativeService, &V2NativePumpPeriodMs};
+            &V2OnNativeService, &V2NativePumpPeriodMs, &V2OnNativeRenderData};
 }
 
 void HookV2Device(IMMDevice* device);

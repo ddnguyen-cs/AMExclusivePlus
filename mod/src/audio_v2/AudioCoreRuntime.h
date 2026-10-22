@@ -154,6 +154,11 @@ public:
     void* OnNativeClientStopped(void* client, HRESULT result) noexcept;
     bool OnStreamingProducerEndOfStream(void* converter) noexcept;
     void OnNativeClientReset(void* client, HRESULT result) noexcept;
+    void OnNativeRenderData(void* client, const float* samples,
+                           std::uint32_t frames, bool silent) noexcept;
+    bool BindNativeStream(std::uint32_t sampleRate, std::uint32_t channels) noexcept;
+    static inline void* const kNativeAacPseudoConverter =
+        reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xAA00CC00));
 
     // Called from the FillComplexBuffer detour after Apple's original call
     // returns. It never waits, allocates, or takes the control mutex.
@@ -290,6 +295,10 @@ private:
     std::atomic<std::uint64_t> boundMediaGeneration_{};
     std::uint32_t requiredPrebufferFrames_{};
     std::wstring nativeEndpoint_;
+    std::uint32_t nativeClientRate_{44100};
+    std::uint32_t nativeClientChannels_{2};
+    std::uint64_t nativeFrameCursor_{};
+    std::uint64_t nextObservationId_{1000};
     ULONGLONG nextTelemetryTick_{};
     // Read-only classifier snapshots continue while the UI switch is Off.
     // This is deliberately separate from the Active telemetry tick so an
