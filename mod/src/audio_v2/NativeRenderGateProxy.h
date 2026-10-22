@@ -160,7 +160,7 @@ public:
         HRESULT result = AUDCLNT_E_NOT_INITIALIZED;
         {
             std::lock_guard lock(innerMutex_);
-            shadow = shadowMode_;
+            shadow = shadowAcquired_;
             if (shadow) {
                 result = shadowAcquired_ && acquiredFrames_ == frames
                     ? S_OK : AUDCLNT_E_BUFFER_ERROR;

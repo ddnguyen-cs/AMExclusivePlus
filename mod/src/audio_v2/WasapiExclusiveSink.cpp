@@ -67,9 +67,7 @@ HRESULT WasapiExclusiveSink::Open(const WasapiSinkConfig& config) noexcept {
             ? config_.format : config_.formatCandidates[index];
         if (!IsValidFormat(candidate) ||
             candidate.sampleRate != config_.format.sampleRate ||
-            candidate.channels != config_.format.channels ||
-            EffectiveSourceValidBits(candidate) !=
-                EffectiveSourceValidBits(config_.format)) {
+            candidate.channels != config_.format.channels) {
             RecordError(E_INVALIDARG);
             NotifyLifecycle(WasapiSinkLifecycleEvent::OpenExit, E_INVALIDARG);
             return E_INVALIDARG;
