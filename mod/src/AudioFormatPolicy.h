@@ -8,6 +8,18 @@
 namespace ammod::audio {
 
 inline constexpr std::uint32_t kLinearPcm = 0x6C70636D; // 'lpcm'
+inline constexpr std::uint32_t kAlac = 0x616C6163u; // 'alac'
+inline constexpr std::uint32_t kQlac = 0x716C6163u; // 'qlac'
+inline constexpr std::uint32_t kQaac = 0x71616163u; // 'qaac'
+inline constexpr std::uint32_t kRawAac = 0x61616320u; // 'aac '
+inline constexpr std::uint32_t kPaac = 0x70616163u; // 'paac'
+inline constexpr std::uint32_t kMp4a = 0x6D703461u; // 'mp4a'
+
+inline constexpr bool IsLossyAacFormat(std::uint32_t formatId) noexcept {
+    return formatId == kQaac || formatId == kRawAac || formatId == kPaac ||
+           formatId == kMp4a || formatId == 0x61616368u /* 'aach' */ ||
+           formatId == 0x61616370u /* 'aacp' */;
+}
 inline constexpr std::uint32_t kFormatFlagIsFloat = 1u << 0;
 inline constexpr std::uint32_t kFormatFlagIsSignedInteger = 1u << 2;
 inline constexpr std::uint32_t kFormatFlagIsNonInterleaved = 1u << 5;
@@ -41,21 +53,24 @@ struct BitPerfectFormatTuple final {
 };
 
 struct BitPerfectFormatCandidates final {
-    std::array<BitPerfectFormatTuple, 3> values{};
+    std::array<BitPerfectFormatTuple, 4> values{};
     std::size_t count{};
 };
 
 constexpr BitPerfectFormatCandidates SelectBitPerfectFormatCandidates(
-    std::uint32_t sourceBitDepth, bool localFloat32 = false) noexcept {
+    std::uint32_t sourceBitDepth, bool localFloat32 = false, bool decodedLossyAac = false) noexcept {
+    if (decodedLossyAac) {
+        return {{{ {24, 24}, {24, 32}, {16, 16}, {32, 32} }}, 4};
+    }
     if (localFloat32) {
         return sourceBitDepth == 32
-            ? BitPerfectFormatCandidates{{{{32, 32}, {}, {}}}, 1}
+            ? BitPerfectFormatCandidates{{{{32, 32}, {}, {}, {}}}, 1}
             : BitPerfectFormatCandidates{};
     }
     switch (sourceBitDepth) {
-    case 16: return {{{{16, 16}, {16, 24}, {16, 32}}}, 3};
-    case 24: return {{{{24, 24}, {24, 32}, {}}}, 2};
-    case 32: return {{{{32, 32}, {}, {}}}, 1};
+    case 16: return {{{{16, 16}, {16, 24}, {16, 32}, {}}}, 3};
+    case 24: return {{{{24, 24}, {24, 32}, {}, {}}}, 2};
+    case 32: return {{{{32, 32}, {}, {}, {}}}, 1};
     default: return {};
     }
 }
@@ -78,6 +93,11 @@ static_assert(SelectBitPerfectFormatCandidates(24).values[1] == BitPerfectFormat
 static_assert(SelectBitPerfectFormatCandidates(32, true).count == 1);
 static_assert(SelectBitPerfectFormatCandidates(32, true).values[0] == BitPerfectFormatTuple{32, 32});
 static_assert(SelectBitPerfectFormatCandidates(20).count == 0);
+static_assert(SelectBitPerfectFormatCandidates(32, false, true).count == 4);
+static_assert(SelectBitPerfectFormatCandidates(32, false, true).values[0] == BitPerfectFormatTuple{24, 24});
+static_assert(SelectBitPerfectFormatCandidates(32, false, true).values[1] == BitPerfectFormatTuple{24, 32});
+static_assert(SelectBitPerfectFormatCandidates(32, false, true).values[2] == BitPerfectFormatTuple{16, 16});
+static_assert(SelectBitPerfectFormatCandidates(32, false, true).values[3] == BitPerfectFormatTuple{32, 32});
 
 constexpr bool PreferExistingCompressedCandidate(std::uint32_t existingFormat,
                                                   std::uint32_t existingRate,

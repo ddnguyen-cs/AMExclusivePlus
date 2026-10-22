@@ -2748,7 +2748,7 @@ AppleOSStatus __cdecl HookV2AudioUnitSetProperty(void* unit, std::uint32_t prope
         g_threadGraphFormat.encodedFormat == qlac &&
         IsSupportedSourceBitDepth(g_threadGraphFormat.sourceBitDepth);
     const bool qaacCandidateMatches = hasFreshCandidate &&
-        g_threadGraphFormat.encodedFormat == qaac;
+        ammod::audio::IsLossyAacFormat(g_threadGraphFormat.encodedFormat);
     const bool localPcmCandidateMatches = hasFreshCandidate &&
         g_threadGraphFormat.encodedFormat == ammod::audio::kLinearPcm &&
         IsSupportedSourceBitDepth(g_threadGraphFormat.sourceBitDepth);
@@ -2758,7 +2758,7 @@ AppleOSStatus __cdecl HookV2AudioUnitSetProperty(void* unit, std::uint32_t prope
     std::uint64_t observationId = (qlacCandidateMatches || qaacCandidateMatches ||
                                    localPcmCandidateMatches)
         ? g_threadGraphFormat.observationId : 0;
-    std::wstring binding = qaacCandidateMatches ? L"same-thread-qaac" :
+    std::wstring binding = qaacCandidateMatches ? L"same-thread-aac" :
         (qlacCandidateMatches ? L"same-thread-qlac" :
          (localPcmCandidateMatches ? L"same-thread-pre-src-lpcm" :
           (hasFreshCandidate ? L"fresh-non-p0" : L"unknown")));

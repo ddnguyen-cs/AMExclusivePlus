@@ -15,7 +15,7 @@ namespace ammod::audio_v2 {
 
 inline constexpr std::uint32_t kStereoChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
 inline constexpr std::uint32_t kSupportedChannels = 2;
-inline constexpr std::uint32_t kMaxFormatCandidates = 3;
+inline constexpr std::uint32_t kMaxFormatCandidates = 4;
 inline constexpr std::uint32_t kMaxBlockFrames = 2048;
 inline constexpr std::uint32_t kMaxBlockSamples = kMaxBlockFrames * kSupportedChannels;
 

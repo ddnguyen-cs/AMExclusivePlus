@@ -20,7 +20,7 @@ constexpr std::uint32_t kReferenceTimePerSecond = 10000000u;
 constexpr std::size_t kProductionQueueCapacity = 256;
 
 bool IsLossyAacFormat(std::uint32_t formatId) noexcept {
-    return formatId == kQaac;
+    return ammod::audio::IsLossyAacFormat(formatId);
 }
 
 bool IsCandidateEncodedFormat(std::uint32_t formatId) noexcept {
@@ -1265,14 +1265,14 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
         snapshot.registration.sourceBitDepth == 32;
     const bool decodedLossyAac = IsLossyAacFormat(snapshot.registration.encodedFormat);
     const auto candidates = ammod::audio::SelectBitPerfectFormatCandidates(
-        snapshot.registration.sourceBitDepth, localFloat32);
+        snapshot.registration.sourceBitDepth, localFloat32, decodedLossyAac);
     config.sink.formatCandidateCount = static_cast<std::uint32_t>(candidates.count);
     for (std::size_t index = 0; index < candidates.count; ++index) {
         config.sink.formatCandidates[index] = {
             format.sampleRate, format.channels,
             candidates.values[index].validBits, candidates.values[index].containerBits,
             PcmEncoding::SignedInteger, true,
-            static_cast<std::uint16_t>(snapshot.registration.sourceBitDepth)};
+            static_cast<std::uint16_t>(decodedLossyAac ? candidates.values[index].validBits : snapshot.registration.sourceBitDepth)};
     }
     config.sink.endpointId = pendingEndpointId_.empty() ? nativeEndpoint_ : pendingEndpointId_;
     config.sink.periodFrames = PeriodFrames(format.sampleRate);
@@ -1536,11 +1536,14 @@ bool AudioCoreRuntime::BuildFormat(const ConverterRegistrationSnapshot& snapshot
     const auto candidates = ammod::audio::SelectBitPerfectFormatCandidates(
         sourceBits,
         snapshot.registration.encodedFormat == kAppleLinearPcm &&
-            (snapshot.registration.appleFormatFlags & kAppleFormatFlagIsFloat) != 0);
+            (snapshot.registration.appleFormatFlags & kAppleFormatFlagIsFloat) != 0,
+            IsLossyAacFormat(snapshot.registration.encodedFormat));
     if (candidates.count == 0) return false;
     output = {snapshot.registration.outputFormat.sampleRate, 2,
               candidates.values[0].validBits, candidates.values[0].containerBits,
-              PcmEncoding::SignedInteger, true, static_cast<std::uint16_t>(sourceBits)};
+              PcmEncoding::SignedInteger, true,
+              static_cast<std::uint16_t>(IsLossyAacFormat(snapshot.registration.encodedFormat)
+                  ? candidates.values[0].validBits : sourceBits)};
     return IsValidFormat(output);
 }
 

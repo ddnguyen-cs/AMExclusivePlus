@@ -1,6 +1,7 @@
 #pragma once
 
 #include "PcmTypes.h"
+#include "../AudioFormatPolicy.h"
 
 #include <array>
 #include <atomic>
@@ -195,7 +196,7 @@ public:
             }
             const auto encoded = slot.encodedFormat.load(std::memory_order_relaxed);
             if (encoded != 0x616C6163u && encoded != 0x716C6163u &&
-                encoded != 0x71616163u && encoded != 0x6C70636Du) { // alac/qlac/qaac/lpcm
+                !ammod::audio::IsLossyAacFormat(encoded) && encoded != 0x6C70636Du) { // alac/qlac/aac/lpcm
                 return false;
             }
             const auto observed = slot.observationId.load(std::memory_order_relaxed);
@@ -248,7 +249,7 @@ public:
             }
             const auto encoded = slot.encodedFormat.load(std::memory_order_relaxed);
             if (encoded != 0x616C6163u && encoded != 0x716C6163u &&
-                encoded != 0x71616163u) continue;
+                !ammod::audio::IsLossyAacFormat(encoded)) continue;
             const auto depth = slot.sourceBitDepth.load(std::memory_order_relaxed);
             // Zero is a valid provisional state for ALAC/QLAC before the
             // decoder cookie arrives. QAAC registrations carry an explicit
