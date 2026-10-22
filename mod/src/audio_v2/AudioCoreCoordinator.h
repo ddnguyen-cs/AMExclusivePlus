@@ -70,7 +70,7 @@ public:
     bool IsEnabled() const noexcept { return gate_.UiEnabled(); }
     AudioCoreGatePhase Phase() const noexcept { return gate_.Phase(); }
     const PcmFormat& Format() const noexcept {
-        return sink_.State() == WasapiSinkState::Closed ? config_.sink.format : sink_.Format();
+        return config_.sink.format;
     }
     const std::wstring& EndpointId() const noexcept { return sink_.EndpointId(); }
     const std::wstring& EndpointName() const noexcept { return sink_.EndpointName(); }

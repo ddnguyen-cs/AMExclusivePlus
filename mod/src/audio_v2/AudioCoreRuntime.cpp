@@ -107,6 +107,7 @@ void AudioCoreRuntime::Stop() noexcept {
     std::lock_guard lock(controlMutex_);
     uiEnabled_.store(false, std::memory_order_release);
     RetireCaptureLocked(false);
+    coordinator_.CloseEndpoint();
     registry_.RetireAll();
     nativeClient_.store(nullptr, std::memory_order_release);
     nativeHandoffPending_.store(false, std::memory_order_release);
@@ -140,6 +141,7 @@ void AudioCoreRuntime::SetUiEnabled(bool enabled) noexcept {
         coordinator_.Phase() != AudioCoreGatePhase::Off;
     if (!hasLiveState) return;
     RetireCaptureLocked(false);
+    coordinator_.CloseEndpoint();
     registry_.RetireAll();
     graphUnit_ = nullptr;
     graphOutputUnit_ = nullptr;
@@ -1171,6 +1173,7 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
                 uiEnabled_.store(false, std::memory_order_release);
                 Emit(AudioCoreRuntimeEvent::Faulted, sinkError);
                 RetireCaptureLocked(false);
+                coordinator_.CloseEndpoint();
                 registry_.RetireAll();
                 continue;
             }
@@ -1340,6 +1343,7 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     if (FAILED(enable) || !tap_.BindActive(graphConverter_, format, generation) ||
         !registry_.Bind(graphConverter_, generation)) {
         coordinator_.Disable();
+        coordinator_.CloseEndpoint();
         const auto error = FAILED(enable) ? enable : E_UNEXPECTED;
         uiEnabled_.store(false, std::memory_order_release);
         Emit(AudioCoreRuntimeEvent::Faulted, error);
@@ -1426,6 +1430,7 @@ void AudioCoreRuntime::TryActivateLocked() noexcept {
         uiEnabled_.store(false, std::memory_order_release);
         Emit(AudioCoreRuntimeEvent::Faulted, graphHandoff);
         RetireCaptureLocked(false);
+        coordinator_.CloseEndpoint();
         registry_.RetireAll();
         return;
     }
@@ -1444,6 +1449,7 @@ void AudioCoreRuntime::TryActivateLocked() noexcept {
         uiEnabled_.store(false, std::memory_order_release);
         Emit(AudioCoreRuntimeEvent::Faulted, handoff);
         RetireCaptureLocked(false);
+        coordinator_.CloseEndpoint();
         registry_.RetireAll();
         return;
     }
@@ -1471,7 +1477,10 @@ void AudioCoreRuntime::TryActivateLocked() noexcept {
         if (!playbackRejected) uiEnabled_.store(false, std::memory_order_release);
         Emit(AudioCoreRuntimeEvent::Faulted, open);
         RetireCaptureLocked(playbackRejected);
-        if (!playbackRejected) registry_.RetireAll();
+        if (!playbackRejected) {
+            coordinator_.CloseEndpoint();
+            registry_.RetireAll();
+        }
         return;
     }
     const HRESULT start = coordinator_.Start();
@@ -1495,6 +1504,7 @@ void AudioCoreRuntime::TryActivateLocked() noexcept {
         uiEnabled_.store(false, std::memory_order_release);
         Emit(AudioCoreRuntimeEvent::Faulted, start);
         RetireCaptureLocked(false);
+        coordinator_.CloseEndpoint();
         registry_.RetireAll();
         return;
     }
@@ -1571,9 +1581,6 @@ void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph) noexcept {
         requiredPrebufferFrames_ = 0;
         nativeFrameCursor_ = 0;
         nextTelemetryTick_ = 0;
-    }
-    if (!keepGraph) {
-        coordinator_.CloseEndpoint();
     }
     if (!keepGraph || graphConverter_ == kNativeAacPseudoConverter) {
         if (graphConverter_ == kNativeAacPseudoConverter) {

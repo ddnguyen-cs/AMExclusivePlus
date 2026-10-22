@@ -62,7 +62,7 @@ HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) n
 
 void AudioCoreCoordinator::Disable() noexcept {
     if (!gate_.UiEnabled() && !queue_ && !source_ && !sourceReadyEvent_ &&
-        sink_.State() == WasapiSinkState::Closed) {
+        sink_.State() != WasapiSinkState::Running) {
         return;
     }
 
