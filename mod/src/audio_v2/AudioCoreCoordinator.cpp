@@ -9,6 +9,7 @@ AudioCoreCoordinator::AudioCoreCoordinator() noexcept
 
 AudioCoreCoordinator::~AudioCoreCoordinator() {
     Disable();
+    CloseEndpoint();
 }
 
 HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) noexcept {
@@ -72,7 +73,8 @@ void AudioCoreCoordinator::Disable() noexcept {
     gate_.SetUiEnabled(false);
     if (sourceReadyEvent_) SetEvent(sourceReadyEvent_);
     sink_.Stop();
-    sink_.Close();
+    // Keep sink_ open so that the existing WASAPI exclusive hardware session
+    // can be reused seamlessly if the next generation has the same format & endpoint.
     source_.reset();
     if (queue_) queue_->Clear();
     queue_.reset();

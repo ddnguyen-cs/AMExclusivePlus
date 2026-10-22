@@ -274,7 +274,7 @@ void AudioCoreRuntime::OnTransportSkip(std::uint64_t epoch) noexcept {
     // armed generation, is an explicit retirement rather than natural EOS.
     RetireCaptureLocked(true);
     seekFence_ = true;
-    seekFenceReleaseTick_ = GetTickCount64() + 500;
+    seekFenceReleaseTick_ = GetTickCount64() + 100;
     Wake();
 }
 
@@ -305,7 +305,7 @@ void AudioCoreRuntime::OnTransportSeekCommit(std::uint64_t epoch) noexcept {
     RetireCaptureLocked(true);
     TryBindGraphLocked();
     seekFence_ = true;
-    seekFenceReleaseTick_ = GetTickCount64() + 500;
+    seekFenceReleaseTick_ = GetTickCount64() + 50;
     Wake();
 }
 
@@ -1364,7 +1364,7 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
 
 void AudioCoreRuntime::ExtendSeekQuietPeriodLocked() noexcept {
     if (!seekFence_ || seekFenceReleaseTick_ == 0) return;
-    seekFenceReleaseTick_ = GetTickCount64() + 500;
+    seekFenceReleaseTick_ = GetTickCount64() + 50;
 }
 
 void AudioCoreRuntime::TryResumePausedSinkLocked() noexcept {
@@ -1571,6 +1571,9 @@ void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph) noexcept {
         requiredPrebufferFrames_ = 0;
         nativeFrameCursor_ = 0;
         nextTelemetryTick_ = 0;
+    }
+    if (!keepGraph) {
+        coordinator_.CloseEndpoint();
     }
     if (!keepGraph || graphConverter_ == kNativeAacPseudoConverter) {
         if (graphConverter_ == kNativeAacPseudoConverter) {

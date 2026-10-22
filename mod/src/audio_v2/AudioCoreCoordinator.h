@@ -64,6 +64,7 @@ public:
     HRESULT Start() noexcept;
     void PauseEndpoint() noexcept;
     HRESULT ResumeEndpoint() noexcept;
+    void CloseEndpoint() noexcept { sink_.Close(); }
 
     bool ShouldSuppressNative() const noexcept;
     bool IsEnabled() const noexcept { return gate_.UiEnabled(); }

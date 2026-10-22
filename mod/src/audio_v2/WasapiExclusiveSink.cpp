@@ -41,6 +41,56 @@ WasapiExclusiveSink::~WasapiExclusiveSink() {
 }
 
 HRESULT WasapiExclusiveSink::Open(const WasapiSinkConfig& config) noexcept {
+    bool canReuse = false;
+    if (state_.load(std::memory_order_acquire) == WasapiSinkState::Open &&
+        client_ != nullptr && render_ != nullptr && device_ != nullptr &&
+        !renderThread_ &&
+        config_.endpointId == config.endpointId &&
+        config_.format.sampleRate == config.format.sampleRate &&
+        config_.format.channels == config.format.channels &&
+        config_.format.encoding == config.format.encoding &&
+        config_.periodFrames == config.periodFrames) {
+        const auto candidateCount = config.formatCandidateCount == 0
+            ? 1u : config.formatCandidateCount;
+        for (std::uint32_t index = 0; index < candidateCount && index < kMaxFormatCandidates; ++index) {
+            const auto& candidate = config.formatCandidateCount == 0
+                ? config.format : config.formatCandidates[index];
+            if (config_.format.validBits == candidate.validBits &&
+                config_.format.containerBits == candidate.containerBits) {
+                canReuse = true;
+                break;
+            }
+        }
+    }
+
+    if (canReuse) {
+        const auto activeFormat = config_.format;
+        config_ = config;
+        config_.format = activeFormat;
+        NotifyLifecycle(WasapiSinkLifecycleEvent::OpenEnter, S_OK);
+        submittedFrames_.store(0, std::memory_order_release);
+        submittedBuffers_.store(0, std::memory_order_release);
+        controlledSilenceFrames_.store(0, std::memory_order_release);
+        sourceWaits_.store(0, std::memory_order_release);
+        underruns_.store(0, std::memory_order_release);
+        getBufferFailures_.store(0, std::memory_order_release);
+        releaseBufferFailures_.store(0, std::memory_order_release);
+        lastError_.store(S_OK, std::memory_order_release);
+        waitingForSource_.store(false, std::memory_order_release);
+        resumeBlocked_.store(false, std::memory_order_release);
+        endOfStreamSubmitted_.store(false, std::memory_order_release);
+        if (client_) {
+            const HRESULT resetHr = client_->Reset();
+            if (FAILED(resetHr) && resetHr != AUDCLNT_E_NOT_INITIALIZED) {
+                canReuse = false;
+            }
+        }
+        if (canReuse) {
+            NotifyLifecycle(WasapiSinkLifecycleEvent::OpenExit, S_OK);
+            return S_OK;
+        }
+    }
+
     Close();
     config_ = config;
     NotifyLifecycle(WasapiSinkLifecycleEvent::OpenEnter, S_OK);
