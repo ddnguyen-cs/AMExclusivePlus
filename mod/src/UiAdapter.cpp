@@ -1153,10 +1153,7 @@ void AttachNowPlayingDacSelector(const Xaml::DependencyObject& content, const Xa
     nowPlayingToggle.VerticalAlignment(Xaml::VerticalAlignment::Center);
     nowPlayingToggle.Margin(Xaml::Thickness{0, 0, 4, 0});
 
-    Media::TranslateTransform toggleOffset;
-    toggleOffset.X(0.0);
-    toggleOffset.Y(-7.0);
-    nowPlayingToggle.RenderTransform(toggleOffset);
+
     Automation::AutomationProperties::SetName(
         nowPlayingToggle, Localized(L"独占模式", L"Exclusive mode"));
     Controls::ToolTipService::SetToolTip(
