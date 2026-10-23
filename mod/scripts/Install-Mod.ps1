@@ -77,10 +77,65 @@ $expectedInstall = [IO.Path]::GetFullPath((Join-Path $env:PUBLIC 'AMExclusive'))
 if ($install -ne $expectedInstall) {
     throw "Refusing unexpected install directory: $install"
 }
-$package = Get-AppxPackage -Name AppleInc.AppleMusicWin -ErrorAction Stop
-$appleMusic = Join-Path $package.InstallLocation 'AppleMusic.exe'
-$version = (Get-Item -LiteralPath $appleMusic).VersionInfo.FileVersion
-$aumid = "$($package.PackageFamilyName)!App"
+function Find-AppleMusic {
+    $packages = @()
+    $p = Get-AppxPackage -Name AppleInc.AppleMusicWin -ErrorAction SilentlyContinue
+    if ($p) { $packages += $p }
+    if ($packages.Count -eq 0) {
+        $p = Get-AppxPackage -Name *AppleMusic* -ErrorAction SilentlyContinue
+        if ($p) { $packages += $p }
+    }
+    try {
+        $p = Get-AppxPackage -AllUsers -Name AppleInc.AppleMusicWin -ErrorAction SilentlyContinue
+        if ($p) { $packages += $p }
+    } catch {}
+    if ($packages.Count -eq 0) {
+        try {
+            $p = Get-AppxPackage -AllUsers -Name *AppleMusic* -ErrorAction SilentlyContinue
+            if ($p) { $packages += $p }
+        } catch {}
+    }
+
+    foreach ($pkg in $packages) {
+        if ($pkg -and $pkg.InstallLocation) {
+            $exe = Join-Path $pkg.InstallLocation 'AppleMusic.exe'
+            if (Test-Path -LiteralPath $exe -PathType Leaf) {
+                return [pscustomobject]@{
+                    Package           = $pkg
+                    InstallLocation   = $pkg.InstallLocation
+                    ExecutablePath    = $exe
+                    PackageFamilyName = $pkg.PackageFamilyName
+                    Aumid             = if ($pkg.PackageFamilyName) { "$($pkg.PackageFamilyName)!App" } else { 'AppleInc.AppleMusicWin_nzyj5cx40ttqa!App' }
+                }
+            }
+        }
+    }
+
+    $proc = Get-Process -Name AppleMusic -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($proc -and $proc.Path -and (Test-Path -LiteralPath $proc.Path -PathType Leaf)) {
+        return [pscustomobject]@{
+            Package           = $null
+            InstallLocation   = (Split-Path -Path $proc.Path -Parent)
+            ExecutablePath    = $proc.Path
+            PackageFamilyName = 'AppleInc.AppleMusicWin_nzyj5cx40ttqa'
+            Aumid             = 'AppleInc.AppleMusicWin_nzyj5cx40ttqa!App'
+        }
+    }
+
+    return $null
+}
+
+$amInfo = Find-AppleMusic
+if (-not $amInfo) {
+    throw "Apple Music for Windows is not installed. Please install Apple Music from the Microsoft Store before installing AMExclusive.`n(Khong tim thay ung dung Apple Music. Vui long cai dat Apple Music tu Microsoft Store truoc khi cai dat AMExclusive.)"
+}
+$appleMusic = $amInfo.ExecutablePath
+$aumid = $amInfo.Aumid
+$version = try {
+    (Get-Item -LiteralPath $appleMusic -ErrorAction Stop).VersionInfo.FileVersion
+} catch {
+    'Unknown'
+}
 
 $payloadFiles = @(
     'am-exclusive-broker.exe',

@@ -36,8 +36,8 @@ function Stop-AppleMusicRuntime {
     Get-Process am-exclusive-broker -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 
-$package = Get-AppxPackage -Name AppleInc.AppleMusicWin -ErrorAction SilentlyContinue
-$aumid = if ($package) { "$($package.PackageFamilyName)!App" } else { '' }
+$package = Get-AppxPackage -Name AppleInc.AppleMusicWin -ErrorAction SilentlyContinue | Select-Object -First 1
+$aumid = if ($package -and $package.PackageFamilyName) { "$($package.PackageFamilyName)!App" } else { 'AppleInc.AppleMusicWin_nzyj5cx40ttqa!App' }
 $wasRunning = [bool](Get-Process AppleMusic -ErrorAction SilentlyContinue)
 Stop-AppleMusicRuntime
 Write-ProgressMilestone 30 'stop_runtime'
